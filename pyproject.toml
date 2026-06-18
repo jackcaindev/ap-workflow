@@ -1,0 +1,52 @@
+[project]
+name = "freight-ap-workflow"
+version = "0.1.0"
+description = "Initial scaffold for a freight accounts payable workflow automation API."
+requires-python = ">=3.12"
+# PEP 621 stores runtime dependencies in this array under [project].
+# A [project.dependencies] table would not be valid project metadata for uv.
+dependencies = [
+    "fastapi",
+    "google-api-python-client",
+    "google-auth",
+    "google-auth-httplib2",
+    "google-auth-oauthlib",
+    "uvicorn",
+    # The asyncio extra installs greenlet, which SQLAlchemy's async session uses
+    # internally when bridging async APIs to its synchronous core.
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "alembic",
+    "pydantic",
+    "pydantic-settings",
+    "httpx",
+    "redis",
+    "anthropic",
+    "langgraph",
+    "langgraph-checkpoint-postgres",
+    "logfire",
+    # The Postgres checkpointer uses psycopg. The binary extra avoids requiring
+    # libpq OS packages in local uv environments and the python:3.12-slim image.
+    "psycopg[binary]",
+    # FastAPI needs python-multipart to parse multipart/form-data uploads for
+    # UploadFile endpoints.
+    "python-multipart",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.uv]
+# This service is an application, not a library package, so uv only needs to
+# create a locked virtualenv for dependencies instead of building/installing
+# the local project as a wheel.
+package = false
