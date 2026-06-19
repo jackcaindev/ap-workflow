@@ -189,6 +189,72 @@ function labelStatus(status: RunStatus): string {
   return status.replaceAll("_", " ");
 }
 
+function parseKeyValueDetails(details: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const part of details.split(",")) {
+    const eqIndex = part.indexOf("=");
+    if (eqIndex === -1) {
+      continue;
+    }
+    const key = part.slice(0, eqIndex).trim();
+    const value = part.slice(eqIndex + 1).trim();
+    result[key] = value;
+  }
+  return result;
+}
+
+function formatReconciliationCheckDetails(check: ReconciliationCheck): string {
+  const { check_name, passed, details } = check;
+
+  if (details.startsWith("skipped:")) {
+    return "Skipped — awaiting documents";
+  }
+
+  switch (check_name) {
+    case "amount_variance": {
+      const parsed = parseKeyValueDetails(details);
+      const invoice = Number(parsed.invoice);
+      const agreedRate = Number(parsed.agreed_rate);
+      const variance = Number(parsed.variance);
+      const invoiceStr = formatMoney(invoice);
+      const agreedStr = formatMoney(agreedRate);
+      const varianceStr = formatMoney(variance);
+      if (passed) {
+        return `Invoice ${invoiceStr} matches agreed rate ${agreedStr} (variance ${varianceStr})`;
+      }
+      return `Invoice ${invoiceStr} vs agreed rate ${agreedStr} — variance ${varianceStr} exceeds 5% tolerance`;
+    }
+    case "carrier_match": {
+      const parsed = parseKeyValueDetails(details);
+      return `Invoice carrier: ${parsed.invoice ?? "-"} / Rate con carrier: ${parsed.rate_con ?? "-"}`;
+    }
+    case "bol_pickup_date": {
+      const parsed = parseKeyValueDetails(details);
+      return `BOL pickup: ${parsed.bol_pickup_date ?? "-"} / Rate con shipment date: ${parsed.rate_con_shipment_date ?? "-"}`;
+    }
+    case "pod_delivery_confirmation": {
+      if (!details.includes("=")) {
+        return details;
+      }
+      const parsed = parseKeyValueDetails(details);
+      const deliveryDate = parsed.delivery_date === "missing" ? "-" : (parsed.delivery_date ?? "-");
+      const condition = parsed.condition === "missing" ? "-" : (parsed.condition ?? "-");
+      return `Delivered ${deliveryDate}, condition: ${condition}`;
+    }
+    case "missing_docs": {
+      if (details.toLowerCase() === "none" || details === "") {
+        return "None";
+      }
+      return details
+        .split(",")
+        .map((doc) => labelStatus(doc.trim()))
+        .join(", ");
+    }
+    default:
+      return details;
+  }
+}
+
 function StatusBadge({ status }: { status: RunStatus }) {
   const className = useMemo(() => {
     if (status === "complete" || status === "approved" || status === "reconciled") {
@@ -598,7 +664,15 @@ function ExtractionSection({ extraction, createdAt }: { extraction: ExtractionDa
   );
 }
 
-function RunDetail({ runId, onBack }: { runId: string; onBack: () => void }) {
+function RunDetail({
+  runId,
+  onBack,
+  onViewShipment,
+}: {
+  runId: string;
+  onBack: () => void;
+  onViewShipment: (loadNumber: string) => void;
+}) {
   const [detail, setDetail] = useState<RunDetailData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -641,14 +715,29 @@ function RunDetail({ runId, onBack }: { runId: string; onBack: () => void }) {
   const isInvoice = docType === "invoice";
   const match = isInvoice ? detail?.match_result : null;
   const lineItems = isInvoice && Array.isArray(extraction?.line_items) ? extraction.line_items : [];
+  const loadNumber =
+    typeof extraction?.load_number === "string" && extraction.load_number.trim() !== ""
+      ? extraction.load_number
+      : null;
 
   return (
     <section>
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div>
-          <button type="button" onClick={onBack} className="mb-2 text-sm font-medium text-slate-600 hover:text-slate-950">
-            Back to Runs
-          </button>
+          <div className="mb-2 flex flex-wrap items-center gap-4">
+            <button type="button" onClick={onBack} className="text-sm font-medium text-slate-600 hover:text-slate-950">
+              Back to Runs
+            </button>
+            {loadNumber ? (
+              <button
+                type="button"
+                onClick={() => onViewShipment(loadNumber)}
+                className="text-sm font-medium text-slate-600 hover:text-slate-950"
+              >
+                View Shipment
+              </button>
+            ) : null}
+          </div>
           <h1 className="text-2xl font-semibold text-slate-950">Run Detail</h1>
           <p className="mt-1 text-sm text-slate-500">{detail?.filename ?? runId}</p>
         </div>
@@ -848,7 +937,7 @@ function ShipmentDetail({ shipmentId, onBack }: { shipmentId: string; onBack: ()
                         {check.passed ? "pass" : "fail"}
                       </span>
                     </td>
-                    <td className="px-4 py-3 text-slate-600">{check.details}</td>
+                    <td className="px-4 py-3 text-slate-600">{formatReconciliationCheckDetails(check)}</td>
                   </tr>
                 ))}
                 {reconciliation === null ? (
@@ -1109,6 +1198,14 @@ export default function App() {
     setActiveView("shipment_detail");
   }
 
+  async function openShipmentByLoadNumber(loadNumber: string) {
+    const shipments = await requestJson<ShipmentSummary[]>("/shipments");
+    const shipment = shipments.find((item) => item.load_number === loadNumber);
+    if (shipment) {
+      openShipment(shipment.id);
+    }
+  }
+
   return (
     <div className="flex min-h-screen bg-slate-100">
       <Sidebar
@@ -1121,7 +1218,11 @@ export default function App() {
         {activeView === "dashboard" ? <Dashboard onOpenShipment={openShipment} /> : null}
         {activeView === "runs" ? <Runs onOpenRun={openRun} /> : null}
         {activeView === "detail" && selectedRunId ? (
-          <RunDetail runId={selectedRunId} onBack={() => setActiveView("runs")} />
+          <RunDetail
+            runId={selectedRunId}
+            onBack={() => setActiveView("runs")}
+            onViewShipment={(loadNumber) => void openShipmentByLoadNumber(loadNumber)}
+          />
         ) : null}
         {activeView === "shipment_detail" && selectedShipmentId ? (
           <ShipmentDetail shipmentId={selectedShipmentId} onBack={() => setActiveView("dashboard")} />
