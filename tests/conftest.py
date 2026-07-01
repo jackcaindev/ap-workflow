@@ -27,6 +27,7 @@ TEST_DATABASE_URL = os.environ.get(
     "postgresql+asyncpg://postgres:postgres@db:5432/freight_ap_test",
 )
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
+os.environ["ANTHROPIC_API_KEY"] = os.environ.get("ANTHROPIC_API_KEY") or "test-key"
 
 from alembic import command
 from alembic.config import Config
@@ -69,6 +70,7 @@ SAMPLE_INVOICE_PDF = FIXTURES_DIR / "sample_invoice.pdf"
 
 TRUNCATE_TABLES_SQL = """
 TRUNCATE TABLE
+    workflow_audit_logs,
     reconciliation_results,
     workflow_runs,
     documents,
@@ -214,11 +216,24 @@ def sample_invoice_pdf() -> Path:
 
 @pytest.fixture
 def mock_claude(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
-    def _configure(*, doc_type: str, extraction: dict[str, Any]) -> None:
+    def _configure(
+        *,
+        doc_type: str,
+        extraction: dict[str, Any],
+        triage: dict[str, Any] | None = None,
+    ) -> None:
+        triage_response = triage or {
+            "route": "escalate_priority",
+            "reasoning": "Invoice amount exceeds agreed rate by more than 5%.",
+            "confidence": 0.92,
+        }
+
         async def mock_create(**kwargs: Any) -> SimpleNamespace:
             system_prompt = kwargs.get("system", "")
             if "classify" in system_prompt.lower():
                 text_response = doc_type
+            elif "triage" in system_prompt.lower():
+                text_response = json.dumps(triage_response)
             else:
                 text_response = json.dumps(extraction)
 
@@ -229,10 +244,12 @@ def mock_claude(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
             )
 
         mock_client = SimpleNamespace(messages=SimpleNamespace(create=mock_create))
-        monkeypatch.setattr(
-            "app.services.extraction.AsyncAnthropic",
-            lambda **_: mock_client,
-        )
+
+        def _mock_anthropic(**_: Any) -> SimpleNamespace:
+            return mock_client
+
+        for module in ("app.services.extraction", "app.services.triage"):
+            monkeypatch.setattr(f"{module}.AsyncAnthropic", _mock_anthropic)
 
     return _configure
 

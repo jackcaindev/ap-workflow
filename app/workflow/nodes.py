@@ -1,17 +1,54 @@
 from typing import Any
 
 from langgraph.types import interrupt
+from sqlalchemy import select
 
 from app.database import AsyncSessionLocal
 from app.models.document import Document
+from app.models.workflow_audit_log import WorkflowAuditLog
+from app.services.audit import log_audit_event
 from app.services.extraction import extract_document
 from app.services.reconciliation import reconcile_shipment
 from app.services.shipment import upsert_shipment
+from app.services.triage import triage_exception
 from app.workflow.state import WorkflowState
 
 
 def _next_iteration(state: WorkflowState) -> int:
     return state.get("iteration_count", 0) + 1
+
+
+def _extraction_summary(extraction: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "doc_type": extraction.get("doc_type"),
+        "carrier_name": extraction.get("carrier_name"),
+        "load_number": extraction.get("load_number"),
+        "total_amount": extraction.get("total_amount"),
+    }
+
+
+async def _log_exception_raised_once(run_id: str, state: WorkflowState) -> None:
+    async with AsyncSessionLocal() as db:
+        existing = await db.execute(
+            select(WorkflowAuditLog.id)
+            .where(
+                WorkflowAuditLog.run_id == run_id,
+                WorkflowAuditLog.event_type == "exception_raised",
+            )
+            .limit(1)
+        )
+        if existing.scalar_one_or_none() is not None:
+            return
+
+    extraction = state.get("extraction") or {}
+    await log_audit_event(
+        run_id,
+        "exception_raised",
+        payload={
+            "exception_reason": state.get("exception_reason"),
+            "extraction": _extraction_summary(extraction),
+        },
+    )
 
 
 async def extract_node(state: WorkflowState) -> dict[str, Any]:
@@ -26,6 +63,11 @@ async def extract_node(state: WorkflowState) -> dict[str, Any]:
     # Nodes return partial state updates because LangGraph owns the canonical
     # state merge. Returning only changed fields keeps reducers like messages
     # meaningful and avoids accidentally overwriting unrelated state.
+    await log_audit_event(
+        state["run_id"],
+        "extracted",
+        payload={"extraction": _extraction_summary(extraction.model_dump(mode="json"))},
+    )
     return {
         "extraction": extraction.model_dump(mode="json"),
         "status": "extracted",
@@ -100,15 +142,39 @@ async def match_node(state: WorkflowState) -> dict[str, Any]:
     }
 
 
-def exception_node(state: WorkflowState) -> dict[str, Any]:
+async def supervisor_node(state: WorkflowState) -> dict[str, Any]:
+    decision = await triage_exception(
+        exception_reason=state.get("exception_reason"),
+        extraction=state.get("extraction"),
+        match_result=state.get("match_result"),
+    )
+    await log_audit_event(
+        state["run_id"],
+        "triaged",
+        payload=decision.model_dump(mode="json"),
+    )
+    return {
+        "triage_route": decision.route,
+        "triage_reasoning": decision.reasoning,
+        "triage_confidence": decision.confidence,
+        "messages": [f"Triage supervisor routed exception as {decision.route}."],
+        "iteration_count": _next_iteration(state),
+    }
+
+
+async def exception_node(state: WorkflowState) -> dict[str, Any]:
     # interrupt() checkpoints the current graph thread and returns control to the
     # caller with this payload. When /workflow/{run_id}/resume sends
     # Command(resume=...), LangGraph re-enters this node and interrupt() returns
     # that resume value, letting the graph continue from the saved checkpoint.
+    await _log_exception_raised_once(state["run_id"], state)
     decision = interrupt(
         {
             "reason": state.get("exception_reason"),
             "extraction": state.get("extraction"),
+            "triage_route": state.get("triage_route"),
+            "triage_reasoning": state.get("triage_reasoning"),
+            "triage_confidence": state.get("triage_confidence"),
         }
     )
     return {
@@ -119,7 +185,12 @@ def exception_node(state: WorkflowState) -> dict[str, Any]:
     }
 
 
-def approve_node(state: WorkflowState) -> dict[str, Any]:
+async def approve_node(state: WorkflowState) -> dict[str, Any]:
+    await log_audit_event(
+        state["run_id"],
+        "approved",
+        payload={"human_decision": state.get("human_decision")},
+    )
     return {
         "status": "approved",
         "messages": ["Human reviewer approved the exception."],
@@ -127,7 +198,12 @@ def approve_node(state: WorkflowState) -> dict[str, Any]:
     }
 
 
-def reject_node(state: WorkflowState) -> dict[str, Any]:
+async def reject_node(state: WorkflowState) -> dict[str, Any]:
+    await log_audit_event(
+        state["run_id"],
+        "rejected",
+        payload={"human_decision": state.get("human_decision")},
+    )
     return {
         "status": "rejected",
         "messages": ["Human reviewer rejected the exception."],
@@ -135,7 +211,8 @@ def reject_node(state: WorkflowState) -> dict[str, Any]:
     }
 
 
-def complete_node(state: WorkflowState) -> dict[str, Any]:
+async def complete_node(state: WorkflowState) -> dict[str, Any]:
+    await log_audit_event(state["run_id"], "completed")
     return {
         "status": "complete",
         "messages": ["Workflow completed."],

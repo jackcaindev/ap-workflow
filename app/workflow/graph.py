@@ -13,11 +13,18 @@ from app.workflow.nodes import (
     extract_node,
     match_node,
     reject_node,
+    supervisor_node,
 )
 from app.workflow.state import WorkflowState
 
 
-RouteName = Literal["exception_node", "approve_node", "reject_node", "complete_node"]
+RouteName = Literal[
+    "supervisor_node",
+    "exception_node",
+    "approve_node",
+    "reject_node",
+    "complete_node",
+]
 
 
 def checkpoint_database_url() -> str:
@@ -31,7 +38,7 @@ def route_after_match(state: WorkflowState) -> RouteName:
     if state.get("iteration_count", 0) > 5:
         return "complete_node"
     if state.get("exception_reason"):
-        return "exception_node"
+        return "supervisor_node"
     return "complete_node"
 
 
@@ -54,6 +61,7 @@ def build_state_graph() -> StateGraph:
     graph = StateGraph(WorkflowState)
     graph.add_node("extract_node", extract_node)
     graph.add_node("match_node", match_node)
+    graph.add_node("supervisor_node", supervisor_node)
     graph.add_node("exception_node", exception_node)
     graph.add_node("approve_node", approve_node)
     graph.add_node("reject_node", reject_node)
@@ -65,10 +73,11 @@ def build_state_graph() -> StateGraph:
         "match_node",
         route_after_match,
         {
-            "exception_node": "exception_node",
+            "supervisor_node": "supervisor_node",
             "complete_node": "complete_node",
         },
     )
+    graph.add_edge("supervisor_node", "exception_node")
     graph.add_conditional_edges(
         "exception_node",
         route_after_exception,

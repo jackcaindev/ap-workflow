@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_session
 from app.models.document import Document
 from app.models.reconciliation_result import ReconciliationResult
+from app.models.workflow_audit_log import WorkflowAuditLog
 from app.models.workflow_run import WorkflowRun
 from app.services.extraction import (
     ExtractionError,
@@ -49,6 +50,32 @@ def _extracted_amount(extraction: dict | None) -> float | None:
 def _exception_reason(run: WorkflowRun) -> str | None:
     payload = run.interrupt_payload or {}
     return payload.get("reason") or payload.get("error")
+
+
+def _triage_from_payload(payload: dict | None) -> dict[str, str | float | None]:
+    if not payload:
+        return {
+            "triage_route": None,
+            "triage_reasoning": None,
+            "triage_confidence": None,
+        }
+    return {
+        "triage_route": payload.get("triage_route"),
+        "triage_reasoning": payload.get("triage_reasoning"),
+        "triage_confidence": payload.get("triage_confidence"),
+    }
+
+
+def _run_sort_key(run: dict) -> tuple[int, int, object]:
+    triage_priority = {
+        "escalate_priority": 0,
+        "escalate_standard": 1,
+        "auto_resolve": 2,
+    }
+    review_priority = 0 if run.get("status") == "awaiting_review" else 1
+    route = run.get("triage_route")
+    route_rank = triage_priority.get(route, 3) if route else 3
+    return (review_priority, route_rank, run.get("created_at"))
 
 
 def graph_config(run_id: str) -> dict[str, dict[str, str]]:
@@ -103,8 +130,10 @@ async def workflow_runs(db: AsyncSession = Depends(get_session)) -> list[dict]:
                 "total_amount": total_amount,
                 "status": run.status,
                 "created_at": run.created_at,
+                **_triage_from_payload(run.interrupt_payload),
             }
         )
+    runs.sort(key=_run_sort_key)
     return runs
 
 
@@ -155,6 +184,9 @@ async def run_workflow(
         "extraction": None,
         "match_result": None,
         "exception_reason": None,
+        "triage_route": None,
+        "triage_reasoning": None,
+        "triage_confidence": None,
         "human_decision": None,
         "status": "running",
         "messages": [],
@@ -221,6 +253,8 @@ async def workflow_detail(run_id: str, db: AsyncSession = Depends(get_session)) 
         "exception_reasons": reconciliation.exception_reasons,
     }
 
+    triage = _triage_from_payload(run.interrupt_payload)
+
     return {
         "run_id": run.run_id,
         "filename": document.filename,
@@ -231,6 +265,7 @@ async def workflow_detail(run_id: str, db: AsyncSession = Depends(get_session)) 
         "match_result": match_result,
         "exception_reason": _exception_reason(run),
         "interrupt_payload": run.interrupt_payload,
+        **triage,
     }
 
 
@@ -256,6 +291,31 @@ async def resume_workflow(
     final_status = result.get("status", "complete")
     await persist_run_state(db, run, status_value=final_status)
     return {"run_id": run_id, "status": final_status}
+
+
+@router.get("/{run_id}/audit")
+async def workflow_audit(run_id: str, db: AsyncSession = Depends(get_session)) -> list[dict]:
+    run = await get_workflow_run(db, run_id)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow run not found")
+
+    result = await db.execute(
+        select(WorkflowAuditLog)
+        .where(WorkflowAuditLog.run_id == run_id)
+        .order_by(WorkflowAuditLog.created_at.asc())
+    )
+    entries = result.scalars().all()
+    return [
+        {
+            "id": entry.id,
+            "run_id": entry.run_id,
+            "event_type": entry.event_type,
+            "payload": entry.payload,
+            "actor": entry.actor,
+            "created_at": entry.created_at,
+        }
+        for entry in entries
+    ]
 
 
 @router.get("/{run_id}/status")

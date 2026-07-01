@@ -22,7 +22,12 @@ type RunSummary = {
   amount: number | null;
   status: RunStatus;
   created_at: string;
+  triage_route: TriageRoute | null;
+  triage_reasoning: string | null;
+  triage_confidence: number | null;
 };
+
+type TriageRoute = "auto_resolve" | "escalate_standard" | "escalate_priority";
 
 type LineItem = {
   description: string;
@@ -72,6 +77,18 @@ type RunDetailData = {
   extraction: ExtractionData | null;
   match_result: MatchResult | null;
   exception_reason: string | null;
+  triage_route: TriageRoute | null;
+  triage_reasoning: string | null;
+  triage_confidence: number | null;
+};
+
+type AuditLogEntry = {
+  id: number;
+  run_id: string;
+  event_type: string;
+  payload: Record<string, unknown> | null;
+  actor: string | null;
+  created_at: string;
 };
 
 type NotificationRecord = {
@@ -255,6 +272,24 @@ function formatReconciliationCheckDetails(check: ReconciliationCheck): string {
   }
 }
 
+function TriageBadge({ route }: { route: TriageRoute }) {
+  const className = useMemo(() => {
+    if (route === "auto_resolve") {
+      return "border-slate-200 bg-slate-100 text-slate-600";
+    }
+    if (route === "escalate_priority") {
+      return "border-orange-200 bg-orange-50 text-orange-700";
+    }
+    return "border-slate-200 bg-slate-50 text-slate-700";
+  }, [route]);
+
+  return (
+    <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-medium ${className}`}>
+      {labelStatus(route)}
+    </span>
+  );
+}
+
 function StatusBadge({ status }: { status: RunStatus }) {
   const className = useMemo(() => {
     if (status === "complete" || status === "approved" || status === "reconciled") {
@@ -356,7 +391,9 @@ function Runs({ onOpenRun }: { onOpenRun: (runId: string) => void }) {
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold text-slate-950">Runs</h1>
-          <p className="mt-1 text-sm text-slate-500">Last 20 workflow runs for debugging.</p>
+          <p className="mt-1 text-sm text-slate-500">
+            Review queue and recent workflow runs. Priority triage items appear first.
+          </p>
         </div>
       </div>
 
@@ -368,6 +405,7 @@ function Runs({ onOpenRun }: { onOpenRun: (runId: string) => void }) {
               <th className="px-4 py-3 font-semibold">Carrier</th>
               <th className="px-4 py-3 font-semibold">Amount</th>
               <th className="px-4 py-3 font-semibold">Status</th>
+              <th className="px-4 py-3 font-semibold">Triage</th>
               <th className="px-4 py-3 font-semibold">Created</th>
             </tr>
           </thead>
@@ -386,19 +424,22 @@ function Runs({ onOpenRun }: { onOpenRun: (runId: string) => void }) {
                 <td className="px-4 py-3">
                   <StatusBadge status={run.status} />
                 </td>
+                <td className="px-4 py-3">
+                  {run.triage_route ? <TriageBadge route={run.triage_route} /> : "-"}
+                </td>
                 <td className="px-4 py-3 text-slate-600">{formatDate(run.created_at)}</td>
               </tr>
             ))}
             {!loading && runs.length === 0 ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={5}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
                   No workflow runs yet.
                 </td>
               </tr>
             ) : null}
             {loading ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={5}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
                   Loading workflow runs...
                 </td>
               </tr>
@@ -508,14 +549,14 @@ function Dashboard({ onOpenShipment }: { onOpenShipment: (shipmentId: string) =>
             ))}
             {!loading && shipments.length === 0 ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={5}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
                   No shipments found.
                 </td>
               </tr>
             ) : null}
             {loading ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={5}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
                   Loading shipments...
                 </td>
               </tr>
@@ -660,6 +701,99 @@ function ExtractionSection({ extraction, createdAt }: { extraction: ExtractionDa
         ))}
         <Field label="Created" value={formatDate(createdAt)} />
       </dl>
+    </div>
+  );
+}
+
+function formatAuditPayloadSummary(entry: AuditLogEntry): string {
+  const payload = entry.payload;
+  if (!payload) {
+    return "-";
+  }
+
+  switch (entry.event_type) {
+    case "extracted": {
+      const extraction = payload.extraction;
+      if (!extraction || typeof extraction !== "object") {
+        return "-";
+      }
+      const summary = extraction as Record<string, unknown>;
+      const parts = [
+        summary.doc_type ? labelStatus(String(summary.doc_type)) : null,
+        summary.carrier_name ? String(summary.carrier_name) : null,
+        summary.load_number ? `Load ${String(summary.load_number)}` : null,
+      ].filter(Boolean);
+      return parts.length > 0 ? parts.join(" · ") : "-";
+    }
+    case "exception_raised":
+      return typeof payload.exception_reason === "string" ? payload.exception_reason : "-";
+    case "triaged": {
+      const route = typeof payload.route === "string" ? labelStatus(payload.route) : null;
+      const reasoning = typeof payload.reasoning === "string" ? payload.reasoning : null;
+      if (route && reasoning) {
+        return `${route}: ${reasoning}`;
+      }
+      return route ?? reasoning ?? "-";
+    }
+    case "approved":
+    case "rejected":
+      return typeof payload.human_decision === "string"
+        ? labelStatus(payload.human_decision)
+        : labelStatus(entry.event_type);
+    case "completed":
+      return "Workflow finished";
+    default:
+      return JSON.stringify(payload);
+  }
+}
+
+function AuditTimeline({ runId }: { runId: string }) {
+  const [entries, setEntries] = useState<AuditLogEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadAudit = useCallback(async () => {
+    try {
+      setError(null);
+      const data = await requestJson<AuditLogEntry[]>(`/workflow/${runId}/audit`);
+      setEntries(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load audit trail");
+    } finally {
+      setLoading(false);
+    }
+  }, [runId]);
+
+  useEffect(() => {
+    setLoading(true);
+    void loadAudit();
+  }, [loadAudit]);
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white p-5">
+      <h2 className="mb-4 text-base font-semibold text-slate-950">Audit Trail</h2>
+      {loading ? <p className="text-sm text-slate-500">Loading audit trail...</p> : null}
+      {error ? <div className="mb-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
+      {!loading && entries.length === 0 ? (
+        <p className="text-sm text-slate-500">No audit events yet.</p>
+      ) : null}
+      {entries.length > 0 ? (
+        <ol className="relative border-l border-slate-200 pl-5">
+          {entries.map((entry) => (
+            <li key={entry.id} className="mb-6 last:mb-0">
+              <span className="absolute -left-1.5 mt-1.5 h-3 w-3 rounded-full border-2 border-white bg-slate-400" />
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-medium text-slate-900">{labelStatus(entry.event_type)}</span>
+                <span className="text-xs text-slate-500">{formatDate(entry.created_at)}</span>
+                {entry.actor ? (
+                  <span className="text-xs text-slate-500">by {entry.actor}</span>
+                ) : null}
+              </div>
+              <p className="mt-1 text-sm text-slate-600">{formatAuditPayloadSummary(entry)}</p>
+            </li>
+          ))}
+        </ol>
+      ) : null}
     </div>
   );
 }
@@ -816,6 +950,21 @@ function RunDetail({
             </div>
           ) : null}
 
+          {detail.triage_reasoning ? (
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-5 text-sm text-slate-800">
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <span className="font-semibold">Triage reasoning</span>
+                {detail.triage_route ? <TriageBadge route={detail.triage_route} /> : null}
+                {detail.triage_confidence !== null && detail.triage_confidence !== undefined ? (
+                  <span className="text-xs text-slate-500">
+                    {(detail.triage_confidence * 100).toFixed(0)}% confidence
+                  </span>
+                ) : null}
+              </div>
+              <p>{detail.triage_reasoning}</p>
+            </div>
+          ) : null}
+
           {detail.status === "awaiting_review" ? (
             <div className="flex gap-3">
               <button
@@ -836,6 +985,8 @@ function RunDetail({
               </button>
             </div>
           ) : null}
+
+          <AuditTimeline key={detail.updated_at} runId={runId} />
         </div>
       ) : null}
     </section>
@@ -1073,14 +1224,14 @@ function CarrierAnalytics() {
             ))}
             {!loading && rows.length === 0 ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={5}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
                   No carrier analytics yet.
                 </td>
               </tr>
             ) : null}
             {loading ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={5}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
                   Loading carrier analytics...
                 </td>
               </tr>
@@ -1153,14 +1304,14 @@ function Notifications() {
             ))}
             {!loading && records.length === 0 ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={5}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
                   No notification records yet.
                 </td>
               </tr>
             ) : null}
             {loading ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={5}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
                   Loading notifications...
                 </td>
               </tr>

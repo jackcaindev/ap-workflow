@@ -10,6 +10,9 @@ class WorkflowState(TypedDict):
     extraction: dict | None
     match_result: dict | None
     exception_reason: str | None
+    triage_route: str | None
+    triage_reasoning: str | None
+    triage_confidence: float | None
     human_decision: str | None
     status: str
     # LangGraph applies the reducer when multiple nodes update this field, so
