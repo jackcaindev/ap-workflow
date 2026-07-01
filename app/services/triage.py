@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from app.core.config import get_settings
 from app.schemas.triage import TriageDecision
 from app.services.extraction import CLAUDE_MODEL, ExtractionError, extract_response_text
+from app.services.json_utils import strip_code_fences
 
 
 TRIAGE_SYSTEM_PROMPT = """You triage freight accounts payable reconciliation exceptions before human review.
@@ -37,10 +38,13 @@ route must be one of: auto_resolve, escalate_standard, escalate_priority.
 
 
 def validate_triage_json(response_text: str) -> TriageDecision:
+    cleaned = strip_code_fences(response_text)
     try:
-        payload = json.loads(response_text)
+        payload = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        raise ExtractionError("Claude returned non-JSON triage output") from exc
+        raise ExtractionError(
+            f"Claude returned non-JSON triage output: {response_text!r}"
+        ) from exc
 
     try:
         return TriageDecision.model_validate(payload)

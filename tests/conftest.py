@@ -230,10 +230,10 @@ def mock_claude(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
 
         async def mock_create(**kwargs: Any) -> SimpleNamespace:
             system_prompt = kwargs.get("system", "")
-            if "classify" in system_prompt.lower():
-                text_response = doc_type
-            elif "triage" in system_prompt.lower():
+            if "triage" in system_prompt.lower():
                 text_response = json.dumps(triage_response)
+            elif "classify" in system_prompt.lower():
+                text_response = doc_type
             else:
                 text_response = json.dumps(extraction)
 

@@ -16,6 +16,7 @@ from app.schemas.extraction import (
     InvoiceExtraction,
     PODExtraction,
 )
+from app.services.json_utils import strip_code_fences
 
 
 CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -128,8 +129,9 @@ def validate_document_type(response_text: str) -> DocumentType:
 
 
 def validate_claude_json(response_text: str, doc_type: DocumentType) -> ExtractionResult:
+    cleaned = strip_code_fences(response_text)
     try:
-        payload = json.loads(response_text)
+        payload = json.loads(cleaned)
     except json.JSONDecodeError as exc:
         raise ExtractionError("Claude returned non-JSON output") from exc
 
