@@ -15,6 +15,7 @@ from app.models.workflow_run import WorkflowRun
 from app.services.extraction import ExtractionError
 from app.services.gmail_poller import INVOICE_QUEUE
 from app.services.notifier import send_batch_summary
+from app.workflow.batch_graph import batch_graph
 from app.workflow.graph import workflow_graph
 
 
@@ -174,6 +175,30 @@ async def _flush_batch_summary(results: list[dict]) -> list[dict]:
     return []
 
 
+async def _drain_batch(
+    redis: Redis,
+    max_batch_size: int,
+    wait_timeout: int,
+) -> list[str]:
+    # Block only for the first job so an idle worker is efficient, then drain
+    # immediately available work without waiting between documents.
+    item = await redis.brpop(INVOICE_QUEUE, timeout=wait_timeout)
+    logger.info("BRPOP returned: %s", item is not None)
+    if item is None:
+        return []
+
+    _, raw_payload = item
+    payloads = [raw_payload]
+    # Bounding the non-blocking drain bounds the Send fan-out, protecting the
+    # Claude API and database connection capacity during inbox catch-up.
+    for _ in range(max(0, max_batch_size - 1)):
+        raw_payload = await redis.rpop(INVOICE_QUEUE)
+        if raw_payload is None:
+            break
+        payloads.append(raw_payload)
+    return payloads
+
+
 async def process_invoice_queue() -> None:
     settings = get_settings()
     redis = Redis.from_url(
@@ -189,13 +214,13 @@ async def process_invoice_queue() -> None:
         logger.info("Invoice worker started")
         batch_results: list[dict] = []
         while True:
-            raw_payload: str | None = None
             try:
-                # BRPOP blocks efficiently at Redis for up to five seconds, then
-                # returns control so cancellation during API shutdown is prompt.
-                item = await redis.brpop(INVOICE_QUEUE, timeout=5)
-                logger.info("BRPOP returned: %s", item is not None)
-                if item is None:
+                raw_payloads = await _drain_batch(
+                    redis,
+                    settings.MAX_BATCH_SIZE,
+                    wait_timeout=5,
+                )
+                if not raw_payloads:
                     # The worker sends summaries when the queue drains because
                     # only completed jobs have extraction/matching results. A
                     # batch email also prevents one notification per invoice
@@ -203,33 +228,40 @@ async def process_invoice_queue() -> None:
                     batch_results = await _flush_batch_summary(batch_results)
                     continue
 
-                _, raw_payload = item
-                job = json.loads(raw_payload)
-                batch_results.append(await _run_workflow_for_job(job))
-            except ExtractionError as exc:
-                logger.warning("Extraction failed for invoice queue payload: %s", exc)
+                jobs: list[dict] = []
+                for raw_payload in raw_payloads:
+                    try:
+                        job = json.loads(raw_payload)
+                        if not isinstance(job, dict):
+                            raise TypeError(
+                                "Invoice queue payload must be a JSON object"
+                            )
+                        jobs.append(job)
+                    except Exception as exc:
+                        logger.exception("Invalid invoice queue payload")
+                        batch_results.append(
+                            _summary_result(
+                                filename="unknown",
+                                run_id="",
+                                status="failed",
+                                exception_reason=str(exc),
+                            )
+                        )
+
+                if jobs:
+                    result = await batch_graph.ainvoke(
+                        {"jobs": jobs, "batch_results": []}
+                    )
+                    batch_results.extend(result["batch_results"])
             except RedisTimeoutError:
                 batch_results = await _flush_batch_summary(batch_results)
                 continue
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                logger.exception("Invoice queue job failed")
-                filename = "unknown"
-                run_id = ""
-                if raw_payload is not None:
-                    try:
-                        payload = json.loads(raw_payload)
-                        filename = payload.get("filename") or filename
-                    except Exception:
-                        pass
-                batch_results.append(
-                    _summary_result(
-                        filename=filename,
-                        run_id=run_id,
-                        status="failed",
-                        exception_reason=str(exc),
-                    )
-                )
+            except Exception:
+                # Per-job failures are converted to branch results. This final
+                # boundary keeps batch-graph plumbing bugs from killing the
+                # long-running background worker.
+                logger.exception("Invoice queue batch failed")
     finally:
         await redis.aclose()

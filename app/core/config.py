@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     GMAIL_CREDENTIALS_PATH: str = "/app/credentials.json"
     GMAIL_TOKEN_PATH: str = "/app/token.json"
     REDIS_URL: str = "redis://localhost:6379/0"
+    # A bounded fan-out limits simultaneous Claude requests, SQLAlchemy
+    # sessions, and per-document LangGraph checkpointer connections.
+    MAX_BATCH_SIZE: int = 10
 
     model_config = SettingsConfigDict(
         env_file=".env",
