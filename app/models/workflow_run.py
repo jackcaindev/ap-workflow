@@ -6,6 +6,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
+from app.models.review_decision import ReviewDecision
 
 
 class WorkflowRun(Base):
@@ -21,6 +22,12 @@ class WorkflowRun(Base):
         index=True,
     )
     status: Mapped[str] = mapped_column(nullable=False, default="pending")
+    processing_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending", server_default="pending"
+    )
+    posting_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="not_ready", server_default="not_ready"
+    )
     # JSONB lets the workflow pause with structured context for a human approval
     # or retry path without locking the schema to one interrupt payload shape.
     interrupt_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
@@ -37,3 +44,9 @@ class WorkflowRun(Base):
     )
 
     document = relationship("Document", back_populates="workflow_runs")
+    review_decision: Mapped["ReviewDecision | None"] = relationship(
+        "ReviewDecision",
+        back_populates="workflow_run",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )

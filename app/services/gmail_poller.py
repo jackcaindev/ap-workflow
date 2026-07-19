@@ -1,21 +1,22 @@
 import asyncio
 import base64
-import json
+import hashlib
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from redis.asyncio import Redis
 
 from app.core.config import get_settings
+from app.schemas.invoice_job import InvoiceJobEnvelope
 from app.services.gmail_auth import get_gmail_service
+from app.services.invoice_queue import enqueue_job
 
 
 logger = logging.getLogger(__name__)
 
 SUPPORTED_ATTACHMENT_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg"}
-INVOICE_QUEUE = "invoice_queue"
-PROCESSED_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 def _supported_attachment(filename: str) -> bool:
@@ -93,6 +94,7 @@ def _download_supported_attachments(service: Any, message_id: str) -> tuple[str,
         attachments.append(
             {
                 "message_id": message_id,
+                "mime_part_id": part.get("partId") or body.get("attachmentId"),
                 "filename": filename,
                 # Redis values are bytes/strings, not nested binary blobs. Base64
                 # keeps the JSON payload transport-safe and reversible for the
@@ -103,6 +105,18 @@ def _download_supported_attachments(service: Any, message_id: str) -> tuple[str,
         )
 
     return thread_id, attachments
+
+
+def _attachment_idempotency_key(
+    gmail_account: str, message_id: str, mime_part_id: str
+) -> str:
+    canonical = f"gmail:v1\0{gmail_account.strip().lower()}\0{message_id}\0{mime_part_id}"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _gmail_account(service: Any) -> str:
+    profile = service.users().getProfile(userId="me").execute()
+    return profile["emailAddress"].strip().lower()
 
 
 def _mark_message_read(service: Any, message_id: str) -> None:
@@ -123,17 +137,11 @@ async def poll_inbox() -> int:
         # flow belongs behind /gmail/auth; a background task should not hang
         # indefinitely waiting for a user to approve credentials.
         service = await asyncio.to_thread(get_gmail_service, allow_interactive=False)
+        gmail_account = await asyncio.to_thread(_gmail_account, service)
         messages = await asyncio.to_thread(_list_unread_messages, service)
 
         for message in messages:
             message_id = message["id"]
-            processed_key = f"processed:{message_id}"
-            # This idempotency key prevents duplicate queue jobs if a poll cycle
-            # crashes after enqueueing attachments but before Gmail removes the
-            # UNREAD label, or if two manual polls overlap.
-            if await redis.exists(processed_key):
-                continue
-
             _, attachments = await asyncio.to_thread(
                 _download_supported_attachments,
                 service,
@@ -143,12 +151,32 @@ async def poll_inbox() -> int:
                 continue
 
             for payload in attachments:
-                await redis.lpush(INVOICE_QUEUE, json.dumps(payload))
+                mime_part_id = payload["mime_part_id"]
+                file_bytes = base64.b64decode(payload["file_bytes"], validate=True)
+                job = InvoiceJobEnvelope(
+                    idempotency_key=_attachment_idempotency_key(
+                        gmail_account, message_id, mime_part_id
+                    ),
+                    gmail_account=gmail_account,
+                    message_id=message_id,
+                    gmail_thread_id=payload["gmail_thread_id"],
+                    mime_part_id=mime_part_id,
+                    filename=payload["filename"],
+                    file_bytes=payload["file_bytes"],
+                    content_sha256=hashlib.sha256(file_bytes).hexdigest(),
+                    enqueued_at=datetime.now(UTC),
+                )
+                await enqueue_job(
+                    redis,
+                    stream=settings.INVOICE_STREAM,
+                    dedupe_prefix=settings.INVOICE_DEDUPE_PREFIX,
+                    dedupe_ttl_seconds=settings.INVOICE_DEDUPE_TTL_SECONDS,
+                    job=job,
+                )
 
             # Notifications are intentionally not sent from the poller. At this
             # point attachments are only queued; extraction, matching, and final
             # workflow status are not known until the worker processes each job.
-            await redis.set(processed_key, "1", ex=PROCESSED_TTL_SECONDS)
             await asyncio.to_thread(_mark_message_read, service, message_id)
             processed_messages += 1
 

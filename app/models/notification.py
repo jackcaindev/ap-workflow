@@ -19,3 +19,8 @@ class Notification(Base):
     complete_count: Mapped[int] = mapped_column(nullable=False)
     awaiting_review_count: Mapped[int] = mapped_column(nullable=False)
     failed_count: Mapped[int] = mapped_column(nullable=False)
+    approved_count: Mapped[int] = mapped_column(nullable=False, default=0, server_default="0")
+    rejected_count: Mapped[int] = mapped_column(nullable=False, default=0, server_default="0")
+    ready_for_posting_count: Mapped[int] = mapped_column(
+        nullable=False, default=0, server_default="0"
+    )

@@ -1,192 +1,312 @@
 import asyncio
+import hashlib
 import json
+from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
-from redis.exceptions import TimeoutError as RedisTimeoutError
+from sqlalchemy import func, select
 
+from app.database import AsyncSessionLocal
+from app.models.document import Document
+from app.models.review_decision import ReviewDecision
+from app.models.workflow_run import WorkflowRun
+from app.schemas.invoice_job import InvoiceJobEnvelope
 from app.services import invoice_worker
+from app.services.invoice_queue import StreamDelivery, claim_stale_batch
+
+
+class FakePipeline:
+    def __init__(self, redis: "FakeRedis") -> None:
+        self.redis = redis
+        self.commands: list[tuple] = []
+
+    async def __aenter__(self) -> "FakePipeline":
+        return self
+
+    async def __aexit__(self, *_args) -> None:
+        return None
+
+    def xadd(self, stream: str, fields: dict) -> None:
+        self.commands.append(("xadd", stream, fields))
+
+    def xack(self, stream: str, group: str, stream_id: str) -> None:
+        self.commands.append(("xack", stream, group, stream_id))
+
+    def xdel(self, stream: str, stream_id: str) -> None:
+        self.commands.append(("xdel", stream, stream_id))
+
+    async def execute(self) -> list[int]:
+        self.redis.operations.extend(self.commands)
+        return [1] * len(self.commands)
 
 
 class FakeRedis:
     def __init__(self) -> None:
-        self.closed = False
+        self.operations: list[tuple] = []
+        self.claimed_entries: list[tuple[str, dict[str, str]]] = []
+        self.pending_attempt = 2
 
-    async def aclose(self) -> None:
-        self.closed = True
+    def pipeline(self, transaction: bool = True) -> FakePipeline:
+        assert transaction is True
+        return FakePipeline(self)
 
+    async def hset(self, key: str, mapping: dict) -> int:
+        self.operations.append(("hset", key, mapping))
+        return 1
 
-async def _run_worker_until_first_summary(
-    monkeypatch: pytest.MonkeyPatch,
-    raw_payloads: list[str],
-) -> tuple[list[dict], FakeRedis]:
-    redis = FakeRedis()
-    drain_calls = 0
-    summaries: list[list[dict]] = []
-
-    async def fake_drain_batch(*_args, **_kwargs) -> list[str]:
-        nonlocal drain_calls
-        drain_calls += 1
-        if drain_calls == 1:
-            return raw_payloads
-        if drain_calls == 2:
-            return []
-        raise asyncio.CancelledError
-
-    async def fake_flush_batch_summary(results: list[dict]) -> list[dict]:
-        summaries.append(list(results))
+    async def xclaim(self, *_args, **_kwargs) -> list[str]:
+        self.operations.append(("heartbeat",))
         return []
 
-    monkeypatch.setattr(
-        invoice_worker.Redis,
-        "from_url",
-        lambda *_args, **_kwargs: redis,
+    async def xautoclaim(self, *_args, **_kwargs):
+        return ["0-0", self.claimed_entries, []]
+
+    async def xpending_range(self, *_args, **_kwargs):
+        return [{"times_delivered": self.pending_attempt}]
+
+
+def settings(**overrides):
+    values = {
+        "INVOICE_STREAM": "jobs",
+        "INVOICE_CONSUMER_GROUP": "workers",
+        "INVOICE_DEAD_LETTER_STREAM": "jobs-dlq",
+        "INVOICE_METADATA_PREFIX": "job-meta",
+        "INVOICE_MAX_ATTEMPTS": 3,
+        "INVOICE_VISIBILITY_TIMEOUT_MS": 300_000,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def make_job(filename: str = "invoice.pdf", suffix: str = "a") -> InvoiceJobEnvelope:
+    content = f"content-{suffix}".encode()
+    import base64
+
+    return InvoiceJobEnvelope(
+        idempotency_key=hashlib.sha256(f"key-{suffix}".encode()).hexdigest(),
+        gmail_account="ap@example.com",
+        message_id=f"message-{suffix}",
+        gmail_thread_id=f"thread-{suffix}",
+        mime_part_id=f"part-{suffix}",
+        filename=filename,
+        file_bytes=base64.b64encode(content).decode(),
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        enqueued_at=datetime.now(UTC),
     )
-    monkeypatch.setattr(invoice_worker, "_drain_batch", fake_drain_batch)
-    monkeypatch.setattr(
-        invoice_worker,
-        "_flush_batch_summary",
-        fake_flush_batch_summary,
+
+
+def delivery(job: InvoiceJobEnvelope, stream_id: str, attempt: int = 1) -> StreamDelivery:
+    return StreamDelivery(
+        stream_id=stream_id,
+        fields={"payload": job.model_dump_json()},
+        attempt=attempt,
     )
 
-    with pytest.raises(asyncio.CancelledError):
-        await invoice_worker.process_invoice_queue()
 
-    assert len(summaries) == 1
-    return summaries[0], redis
+async def test_success_is_acknowledged_only_after_processing(monkeypatch):
+    redis = FakeRedis()
+    events: list[str] = []
 
-
-async def test_worker_processes_multiple_jobs_in_one_batch_summary(monkeypatch):
-    jobs = [
-        {"filename": "invoice-a.pdf", "file_bytes": "YQ=="},
-        {"filename": "invoice-b.pdf", "file_bytes": "Yg=="},
-        {"filename": "invoice-c.pdf", "file_bytes": "Yw=="},
-    ]
-
-    async def fake_run_workflow_for_job(job: dict) -> dict:
+    async def fake_run(job: InvoiceJobEnvelope) -> dict:
+        events.append("processed")
         return invoice_worker._summary_result(
-            filename=job["filename"],
-            run_id=f"run-{job['filename']}",
-            status="complete",
+            filename=job.filename, run_id="run-1", status="complete"
         )
 
-    monkeypatch.setattr(
-        invoice_worker,
-        "_run_workflow_for_job",
-        fake_run_workflow_for_job,
+    async def fake_acknowledge(_redis, **_kwargs) -> None:
+        events.append("acknowledged")
+
+    monkeypatch.setattr(invoice_worker, "_run_workflow_for_job", fake_run)
+    monkeypatch.setattr(invoice_worker, "acknowledge", fake_acknowledge)
+
+    result = await invoice_worker._process_delivery(
+        redis, delivery(make_job(), "1-0"), settings(), "consumer-a"
     )
 
-    summary, redis = await _run_worker_until_first_summary(
-        monkeypatch,
-        [json.dumps(job) for job in jobs],
+    assert result["status"] == "complete"
+    assert events == ["processed", "acknowledged"]
+
+
+async def test_worker_crash_leaves_delivery_recoverable(monkeypatch):
+    redis = FakeRedis()
+    started = asyncio.Event()
+
+    async def crash_point(_job: InvoiceJobEnvelope) -> dict:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(invoice_worker, "_run_workflow_for_job", crash_point)
+    original = delivery(make_job(), "2-0")
+    task = asyncio.create_task(
+        invoice_worker._process_delivery(redis, original, settings(), "consumer-a")
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not any(op[0] in {"xack", "xdel", "xadd"} for op in redis.operations)
+    redis.claimed_entries = [(original.stream_id, original.fields)]
+    reclaimed = await claim_stale_batch(
+        redis,
+        stream="jobs",
+        group="workers",
+        consumer="consumer-b",
+        min_idle_ms=1,
+        count=10,
+    )
+    assert reclaimed == [StreamDelivery("2-0", original.fields, attempt=2)]
+
+
+async def test_redelivery_does_not_duplicate_document_or_workflow_run():
+    job = make_job(suffix="redelivery")
+
+    first_document, first_run = await invoice_worker._get_or_create_job_records(job)
+    second_document, second_run = await invoice_worker._get_or_create_job_records(job)
+
+    assert second_document.id == first_document.id
+    assert second_run.run_id == first_run.run_id
+    async with AsyncSessionLocal() as db:
+        document_count = await db.scalar(
+            select(func.count(Document.id)).where(
+                Document.source_idempotency_key == job.idempotency_key
+            )
+        )
+        run_count = await db.scalar(
+            select(func.count(WorkflowRun.id)).where(
+                WorkflowRun.run_id == first_run.run_id
+            )
+        )
+    assert document_count == 1
+    assert run_count == 1
+
+
+async def test_redelivery_after_review_short_circuits_graph_and_acknowledges(monkeypatch):
+    job = make_job(suffix="reviewed-redelivery")
+    _, created_run = await invoice_worker._get_or_create_job_records(job)
+    async with AsyncSessionLocal() as db:
+        run = await db.scalar(
+            select(WorkflowRun).where(WorkflowRun.run_id == created_run.run_id)
+        )
+        run.status = "approved"
+        run.processing_status = "complete"
+        run.posting_status = "ready_for_posting"
+        db.add(ReviewDecision(run_id=run.run_id, disposition="approved"))
+        await db.commit()
+
+    async def unexpected_graph_call(*_args, **_kwargs):
+        raise AssertionError("reviewed redelivery must not invoke LangGraph")
+
+    monkeypatch.setattr(invoice_worker.workflow_graph, "aget_state", unexpected_graph_call)
+    monkeypatch.setattr(invoice_worker.workflow_graph, "ainvoke", unexpected_graph_call)
+    redis = FakeRedis()
+
+    result = await invoice_worker._process_delivery(
+        redis,
+        delivery(job, "reviewed-1", attempt=2),
+        settings(),
+        "consumer-b",
     )
 
-    assert {result["filename"] for result in summary} == {
-        "invoice-a.pdf",
-        "invoice-b.pdf",
-        "invoice-c.pdf",
-    }
-    assert all(result["status"] == "complete" for result in summary)
-    assert redis.closed is True
-
-
-async def test_one_batch_job_failure_does_not_block_siblings(monkeypatch):
-    jobs = [
-        {"filename": "invoice-a.pdf", "file_bytes": "YQ=="},
-        {"filename": "broken.pdf", "file_bytes": "Yg=="},
-        {"filename": "invoice-c.pdf", "file_bytes": "Yw=="},
+    assert result["status"] == "approved"
+    assert result["processing_status"] == "complete"
+    assert result["review_disposition"] == "approved"
+    assert result["posting_status"] == "ready_for_posting"
+    assert [operation[0] for operation in redis.operations if operation[0] != "heartbeat"] == [
+        "xack",
+        "xdel",
     ]
 
-    async def fake_run_workflow_for_job(job: dict) -> dict:
-        if job["filename"] == "broken.pdf":
+
+async def test_transient_failures_retry_up_to_limit(monkeypatch):
+    redis = FakeRedis()
+    job = make_job(suffix="retry")
+
+    async def fail(_job: InvoiceJobEnvelope) -> dict:
+        raise RuntimeError("temporary outage")
+
+    async def no_op_mark_failed(*_args) -> None:
+        return None
+
+    monkeypatch.setattr(invoice_worker, "_run_workflow_for_job", fail)
+    monkeypatch.setattr(invoice_worker, "_mark_job_failed", no_op_mark_failed)
+
+    for attempt in (1, 2, 3):
+        await invoice_worker._process_delivery(
+            redis,
+            delivery(job, f"3-{attempt}", attempt=attempt),
+            settings(),
+            "consumer-a",
+        )
+
+    retry_updates = [op for op in redis.operations if op[0] == "hset"]
+    dlq_writes = [op for op in redis.operations if op[0] == "xadd"]
+    assert [op[2]["attempt_count"] for op in retry_updates] == [1, 2]
+    assert len(dlq_writes) == 1
+    assert dlq_writes[0][2]["attempt_count"] == "3"
+
+
+async def test_permanent_failure_enters_dead_letter_stream():
+    redis = FakeRedis()
+    invalid = StreamDelivery("4-0", {"payload": json.dumps({"schema_version": 99})})
+
+    result = await invoice_worker._process_delivery(
+        redis, invalid, settings(), "consumer-a"
+    )
+
+    assert result["status"] == "failed"
+    assert [op[0] for op in redis.operations] == ["xadd", "xack", "xdel"]
+    assert redis.operations[0][1] == "jobs-dlq"
+
+
+async def test_failed_batch_job_does_not_block_siblings(monkeypatch):
+    redis = FakeRedis()
+    good_a = make_job("a.pdf", "batch-a")
+    broken = make_job("broken.pdf", "batch-broken")
+    good_c = make_job("c.pdf", "batch-c")
+
+    async def run(job: InvoiceJobEnvelope) -> dict:
+        if job.filename == "broken.pdf":
             raise RuntimeError("branch failed")
         return invoice_worker._summary_result(
-            filename=job["filename"],
-            run_id=f"run-{job['filename']}",
-            status="complete",
+            filename=job.filename, run_id=job.idempotency_key[:8], status="complete"
         )
 
-    monkeypatch.setattr(
-        invoice_worker,
-        "_run_workflow_for_job",
-        fake_run_workflow_for_job,
+    async def no_op_mark_failed(*_args) -> None:
+        return None
+
+    monkeypatch.setattr(invoice_worker, "_run_workflow_for_job", run)
+    monkeypatch.setattr(invoice_worker, "_mark_job_failed", no_op_mark_failed)
+    deliveries = [
+        delivery(good_a, "5-1", attempt=3),
+        delivery(broken, "5-2", attempt=3),
+        delivery(good_c, "5-3", attempt=3),
+    ]
+
+    results = await invoice_worker._process_batch(
+        redis, deliveries, settings(), "consumer-a"
     )
 
-    summary, _ = await _run_worker_until_first_summary(
-        monkeypatch,
-        [json.dumps(job) for job in jobs],
-    )
-    by_filename = {result["filename"]: result for result in summary}
-
-    assert by_filename["invoice-a.pdf"]["status"] == "complete"
-    assert by_filename["invoice-c.pdf"]["status"] == "complete"
-    assert by_filename["broken.pdf"]["status"] == "failed"
-    assert by_filename["broken.pdf"]["exception_reason"] == "branch failed"
+    assert {result["filename"] for result in results} == {
+        "a.pdf",
+        "broken.pdf",
+        "c.pdf",
+    }
+    acked_ids = {op[3] for op in redis.operations if op[0] == "xack"}
+    assert acked_ids == {"5-1", "5-2", "5-3"}
 
 
-async def test_drain_batch_caps_number_of_popped_jobs():
-    class QueueRedis:
-        def __init__(self) -> None:
-            self.remaining = ["second", "third", "fourth"]
-            self.rpop_calls = 0
+async def test_malformed_payload_is_retained_for_investigation():
+    redis = FakeRedis()
+    malformed = StreamDelivery("6-0", {"payload": "{not-json"})
 
-        async def brpop(self, queue: str, timeout: int):
-            assert queue == invoice_worker.INVOICE_QUEUE
-            assert timeout == 5
-            return queue, "first"
-
-        async def rpop(self, queue: str):
-            assert queue == invoice_worker.INVOICE_QUEUE
-            self.rpop_calls += 1
-            return self.remaining.pop(0) if self.remaining else None
-
-    redis = QueueRedis()
-
-    payloads = await invoice_worker._drain_batch(
-        redis,
-        max_batch_size=3,
-        wait_timeout=5,
+    await invoice_worker._process_delivery(
+        redis, malformed, settings(), "consumer-a"
     )
 
-    assert payloads == ["first", "second", "third"]
-    assert redis.rpop_calls == 2
-    assert redis.remaining == ["fourth"]
-
-
-async def test_redis_socket_timeout_uses_worker_timeout_path(monkeypatch):
-    class TimeoutRedis(FakeRedis):
-        def __init__(self) -> None:
-            super().__init__()
-            self.brpop_calls = 0
-
-        async def brpop(self, _queue: str, timeout: int):
-            assert timeout == 5
-            self.brpop_calls += 1
-            if self.brpop_calls == 1:
-                raise RedisTimeoutError("socket timeout")
-            raise asyncio.CancelledError
-
-    redis = TimeoutRedis()
-    flush_calls = 0
-
-    async def fake_flush_batch_summary(results: list[dict]) -> list[dict]:
-        nonlocal flush_calls
-        flush_calls += 1
-        return results
-
-    monkeypatch.setattr(
-        invoice_worker.Redis,
-        "from_url",
-        lambda *_args, **_kwargs: redis,
-    )
-    monkeypatch.setattr(
-        invoice_worker,
-        "_flush_batch_summary",
-        fake_flush_batch_summary,
-    )
-
-    with pytest.raises(asyncio.CancelledError):
-        await invoice_worker.process_invoice_queue()
-
-    assert flush_calls == 1
-    assert redis.brpop_calls == 2
-    assert redis.closed is True
+    dlq_fields = next(op[2] for op in redis.operations if op[0] == "xadd")
+    assert dlq_fields["original_stream_id"] == "6-0"
+    assert "not-json" in dlq_fields["original_fields"]
+    assert "not valid JSON" in dlq_fields["failure_reason"]

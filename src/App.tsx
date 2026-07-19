@@ -1,4 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  checkOutcome,
+  normalizeBusinessState,
+  type CheckOutcome,
+  type PostingStatus,
+  type ProcessingStatus,
+  type ReviewDisposition,
+} from "./businessState";
 
 type View = "dashboard" | "shipment_detail" | "runs" | "detail" | "analytics" | "notifications";
 
@@ -21,6 +29,12 @@ type RunSummary = {
   carrier_name: string | null;
   amount: number | null;
   status: RunStatus;
+  processing_status: ProcessingStatus;
+  reconciliation_status: ShipmentStatus | null;
+  review_disposition: ReviewDisposition;
+  posting_status: PostingStatus;
+  reviewed_at: string | null;
+  reviewer_id: string | null;
   created_at: string;
   triage_route: TriageRoute | null;
   triage_reasoning: string | null;
@@ -72,6 +86,12 @@ type RunDetailData = {
   run_id: string;
   filename: string;
   status: RunStatus;
+  processing_status: ProcessingStatus;
+  reconciliation_status: ShipmentStatus | null;
+  review_disposition: ReviewDisposition;
+  posting_status: PostingStatus;
+  reviewed_at: string | null;
+  reviewer_id: string | null;
   created_at: string;
   updated_at: string;
   extraction: ExtractionData | null;
@@ -98,6 +118,9 @@ type NotificationRecord = {
   complete_count: number;
   awaiting_review_count: number;
   failed_count: number;
+  approved_count: number;
+  rejected_count: number;
+  ready_for_posting_count: number;
 };
 
 type ShipmentStatus = "pending" | "partial" | "reconciled" | "exception" | string;
@@ -117,7 +140,8 @@ type ShipmentSummary = {
 
 type ReconciliationCheck = {
   check_name: string;
-  passed: boolean;
+  outcome?: CheckOutcome;
+  passed?: boolean;
   details: string;
 };
 
@@ -153,6 +177,10 @@ type CarrierAnalyticsRow = {
   exception_count: number;
   exception_rate: number;
   most_common_exception_type: string | null;
+  pending_review_count: number;
+  approved_count: number;
+  rejected_count: number;
+  ready_for_posting_count: number;
 };
 
 const API_URL = (import.meta.env.VITE_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
@@ -221,7 +249,8 @@ function parseKeyValueDetails(details: string): Record<string, string> {
 }
 
 function formatReconciliationCheckDetails(check: ReconciliationCheck): string {
-  const { check_name, passed, details } = check;
+  const { check_name, details } = check;
+  const outcome = checkOutcome(check);
 
   if (details.startsWith("skipped:")) {
     return "Skipped — awaiting documents";
@@ -236,7 +265,7 @@ function formatReconciliationCheckDetails(check: ReconciliationCheck): string {
       const invoiceStr = formatMoney(invoice);
       const agreedStr = formatMoney(agreedRate);
       const varianceStr = formatMoney(variance);
-      if (passed) {
+      if (outcome === "passed") {
         return `Invoice ${invoiceStr} matches agreed rate ${agreedStr} (variance ${varianceStr})`;
       }
       return `Invoice ${invoiceStr} vs agreed rate ${agreedStr} — variance ${varianceStr} exceeds 5% tolerance`;
@@ -370,7 +399,7 @@ function Runs({ onOpenRun }: { onOpenRun: (runId: string) => void }) {
     try {
       setError(null);
       const data = await requestJson<RunSummary[]>("/workflow/runs");
-      setRuns(data);
+      setRuns(data.map(normalizeBusinessState));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load workflow runs");
     } finally {
@@ -404,7 +433,10 @@ function Runs({ onOpenRun }: { onOpenRun: (runId: string) => void }) {
               <th className="px-4 py-3 font-semibold">Filename</th>
               <th className="px-4 py-3 font-semibold">Carrier</th>
               <th className="px-4 py-3 font-semibold">Amount</th>
-              <th className="px-4 py-3 font-semibold">Status</th>
+              <th className="px-4 py-3 font-semibold">Processing</th>
+              <th className="px-4 py-3 font-semibold">Reconciliation</th>
+              <th className="px-4 py-3 font-semibold">Review</th>
+              <th className="px-4 py-3 font-semibold">Downstream</th>
               <th className="px-4 py-3 font-semibold">Triage</th>
               <th className="px-4 py-3 font-semibold">Created</th>
             </tr>
@@ -422,7 +454,16 @@ function Runs({ onOpenRun }: { onOpenRun: (runId: string) => void }) {
                   {run.doc_type === "invoice" ? formatMoney(run.amount) : "-"}
                 </td>
                 <td className="px-4 py-3">
-                  <StatusBadge status={run.status} />
+                  <StatusBadge status={run.processing_status} />
+                </td>
+                <td className="px-4 py-3">
+                  {run.reconciliation_status ? <StatusBadge status={run.reconciliation_status} /> : "-"}
+                </td>
+                <td className="px-4 py-3">
+                  <StatusBadge status={run.review_disposition} />
+                </td>
+                <td className="px-4 py-3">
+                  <StatusBadge status={run.posting_status} />
                 </td>
                 <td className="px-4 py-3">
                   {run.triage_route ? <TriageBadge route={run.triage_route} /> : "-"}
@@ -432,14 +473,14 @@ function Runs({ onOpenRun }: { onOpenRun: (runId: string) => void }) {
             ))}
             {!loading && runs.length === 0 ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={9}>
                   No workflow runs yet.
                 </td>
               </tr>
             ) : null}
             {loading ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={9}>
                   Loading workflow runs...
                 </td>
               </tr>
@@ -816,7 +857,7 @@ function RunDetail({
     try {
       setError(null);
       const data = await requestJson<RunDetailData>(`/workflow/${runId}`);
-      setDetail(data);
+      setDetail(normalizeBusinessState(data));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load workflow run");
     } finally {
@@ -838,7 +879,9 @@ function RunDetail({
       });
       await loadDetail();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Decision failed");
+      const message = err instanceof Error ? err.message : "Decision failed";
+      await loadDetail();
+      setError(message);
     } finally {
       setDeciding(null);
     }
@@ -875,7 +918,7 @@ function RunDetail({
           <h1 className="text-2xl font-semibold text-slate-950">Run Detail</h1>
           <p className="mt-1 text-sm text-slate-500">{detail?.filename ?? runId}</p>
         </div>
-        {detail ? <StatusBadge status={detail.status} /> : null}
+        {detail ? <StatusBadge status={detail.review_disposition} /> : null}
       </div>
 
       {error ? <div className="mb-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
@@ -883,6 +926,21 @@ function RunDetail({
 
       {detail ? (
         <div className="space-y-6">
+          <div className="rounded-lg border border-slate-200 bg-white p-5">
+            <h2 className="mb-4 text-base font-semibold text-slate-950">Business State</h2>
+            <div className="grid gap-4 md:grid-cols-4">
+              <Field label="Processing" value={labelStatus(detail.processing_status)} />
+              <Field
+                label="Reconciliation"
+                value={detail.reconciliation_status ? labelStatus(detail.reconciliation_status) : "-"}
+              />
+              <Field label="Review" value={labelStatus(detail.review_disposition)} />
+              <Field label="Downstream" value={labelStatus(detail.posting_status)} />
+              <Field label="Decision time" value={formatDate(detail.reviewed_at)} />
+              <Field label="Reviewer" value={detail.reviewer_id ?? "Reviewer not captured"} />
+            </div>
+          </div>
+
           <ExtractionSection extraction={extraction ?? null} createdAt={detail.created_at} />
 
           {isInvoice ? (
@@ -965,7 +1023,7 @@ function RunDetail({
             </div>
           ) : null}
 
-          {detail.status === "awaiting_review" ? (
+          {detail.processing_status === "awaiting_review" && detail.review_disposition === "pending" ? (
             <div className="flex gap-3">
               <button
                 type="button"
@@ -1074,23 +1132,26 @@ function ShipmentDetail({ shipmentId, onBack }: { shipmentId: string; onBack: ()
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {(reconciliation?.checks ?? []).map((check) => (
-                  <tr key={check.check_name}>
-                    <td className="px-4 py-3 font-medium text-slate-900">{labelStatus(check.check_name)}</td>
-                    <td className="px-4 py-3">
-                      <span
-                        className={`rounded-full border px-2.5 py-1 text-xs font-medium ${
-                          check.passed
-                            ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                            : "border-red-200 bg-red-50 text-red-700"
-                        }`}
-                      >
-                        {check.passed ? "pass" : "fail"}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-slate-600">{formatReconciliationCheckDetails(check)}</td>
-                  </tr>
-                ))}
+                {(reconciliation?.checks ?? []).map((check) => {
+                  const outcome = checkOutcome(check);
+                  const outcomeClass =
+                    outcome === "passed"
+                      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                      : outcome === "failed"
+                        ? "border-red-200 bg-red-50 text-red-700"
+                        : "border-amber-200 bg-amber-50 text-amber-700";
+                  return (
+                    <tr key={check.check_name}>
+                      <td className="px-4 py-3 font-medium text-slate-900">{labelStatus(check.check_name)}</td>
+                      <td className="px-4 py-3">
+                        <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${outcomeClass}`}>
+                          {labelStatus(outcome)}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-slate-600">{formatReconciliationCheckDetails(check)}</td>
+                    </tr>
+                  );
+                })}
                 {reconciliation === null ? (
                   <tr>
                     <td className="px-4 py-8 text-center text-slate-500" colSpan={3}>
@@ -1207,6 +1268,10 @@ function CarrierAnalytics() {
               <th className="px-4 py-3 font-semibold">Shipments</th>
               <th className="px-4 py-3 font-semibold">Exceptions</th>
               <th className="px-4 py-3 font-semibold">Exception Rate</th>
+              <th className="px-4 py-3 font-semibold">Pending Review</th>
+              <th className="px-4 py-3 font-semibold">Approved</th>
+              <th className="px-4 py-3 font-semibold">Rejected</th>
+              <th className="px-4 py-3 font-semibold">Ready to Post</th>
               <th className="px-4 py-3 font-semibold">Most Common Exception</th>
             </tr>
           </thead>
@@ -1217,6 +1282,10 @@ function CarrierAnalytics() {
                 <td className="px-4 py-3 text-slate-600">{row.total_shipments}</td>
                 <td className="px-4 py-3 text-slate-600">{row.exception_count}</td>
                 <td className="px-4 py-3 text-slate-600">{formatPercent(row.exception_rate)}</td>
+                <td className="px-4 py-3 text-slate-600">{row.pending_review_count}</td>
+                <td className="px-4 py-3 text-slate-600">{row.approved_count}</td>
+                <td className="px-4 py-3 text-slate-600">{row.rejected_count}</td>
+                <td className="px-4 py-3 text-slate-600">{row.ready_for_posting_count}</td>
                 <td className="px-4 py-3 text-slate-600">
                   {row.most_common_exception_type ? labelStatus(row.most_common_exception_type) : "-"}
                 </td>
@@ -1224,14 +1293,14 @@ function CarrierAnalytics() {
             ))}
             {!loading && rows.length === 0 ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={9}>
                   No carrier analytics yet.
                 </td>
               </tr>
             ) : null}
             {loading ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={9}>
                   Loading carrier analytics...
                 </td>
               </tr>
@@ -1289,6 +1358,9 @@ function Notifications() {
               <th className="px-4 py-3 font-semibold">Processed</th>
               <th className="px-4 py-3 font-semibold">Complete</th>
               <th className="px-4 py-3 font-semibold">Needs Review</th>
+              <th className="px-4 py-3 font-semibold">Approved</th>
+              <th className="px-4 py-3 font-semibold">Rejected</th>
+              <th className="px-4 py-3 font-semibold">Ready to Post</th>
               <th className="px-4 py-3 font-semibold">Failed</th>
             </tr>
           </thead>
@@ -1299,19 +1371,22 @@ function Notifications() {
                 <td className="px-4 py-3 text-slate-600">{record.total_count}</td>
                 <td className="px-4 py-3 text-slate-600">{record.complete_count}</td>
                 <td className="px-4 py-3 text-slate-600">{record.awaiting_review_count}</td>
+                <td className="px-4 py-3 text-slate-600">{record.approved_count}</td>
+                <td className="px-4 py-3 text-slate-600">{record.rejected_count}</td>
+                <td className="px-4 py-3 text-slate-600">{record.ready_for_posting_count}</td>
                 <td className="px-4 py-3 text-slate-600">{record.failed_count}</td>
               </tr>
             ))}
             {!loading && records.length === 0 ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={8}>
                   No notification records yet.
                 </td>
               </tr>
             ) : null}
             {loading ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={6}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={8}>
                   Loading notifications...
                 </td>
               </tr>

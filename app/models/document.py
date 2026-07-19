@@ -25,6 +25,14 @@ class Document(Base):
     status: Mapped[str] = mapped_column(nullable=False, default="received")
     raw_text: Mapped[str | None] = mapped_column(Text)
     extracted_data: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    source_type: Mapped[str | None] = mapped_column(String(32))
+    source_idempotency_key: Mapped[str | None] = mapped_column(
+        String(64), unique=True, index=True
+    )
+    source_message_id: Mapped[str | None] = mapped_column(String(255))
+    source_part_id: Mapped[str | None] = mapped_column(String(255))
+    source_enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
     shipment_id: Mapped[UUID | None] = mapped_column(
         PostgresUUID(as_uuid=True),
         ForeignKey("shipments.id", ondelete="SET NULL"),

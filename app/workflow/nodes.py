@@ -71,13 +71,19 @@ async def extract_node(state: WorkflowState) -> dict[str, Any]:
     return {
         "extraction": extraction.model_dump(mode="json"),
         "status": "extracted",
+        "processing_status": "running",
         "messages": ["Extracted document with Claude vision."],
         "iteration_count": _next_iteration(state),
     }
 
 
 def _reconciliation_exception_reason(exception_reasons: list[str], checks: list[dict]) -> str:
-    failed_checks = [check for check in checks if not check.get("passed")]
+    failed_checks = [
+        check
+        for check in checks
+        if check.get("outcome") == "failed"
+        or ("outcome" not in check and check.get("passed") is False)
+    ]
     if not failed_checks:
         return ", ".join(exception_reasons)
     details = "; ".join(
@@ -122,6 +128,7 @@ async def match_node(state: WorkflowState) -> dict[str, Any]:
             "match_result": match_result,
             "exception_reason": None,
             "status": "matched",
+            "processing_status": "running",
             "messages": [
                 f"Reconciled shipment state for load number {extraction.get('load_number')}."
             ],
@@ -137,6 +144,7 @@ async def match_node(state: WorkflowState) -> dict[str, Any]:
         "match_result": match_result,
         "exception_reason": exception_reason,
         "status": "exception",
+        "processing_status": "running",
         "messages": [f"Shipment reconciliation failed: {exception_reason}."],
         "iteration_count": _next_iteration(state),
     }
@@ -180,41 +188,77 @@ async def exception_node(state: WorkflowState) -> dict[str, Any]:
     return {
         "human_decision": decision,
         "status": "awaiting_review",
+        "processing_status": "awaiting_review",
+        "review_disposition": decision,
         "messages": ["Paused for human review."],
         "iteration_count": _next_iteration(state),
     }
 
 
 async def approve_node(state: WorkflowState) -> dict[str, Any]:
-    await log_audit_event(
-        state["run_id"],
-        "approved",
-        payload={"human_decision": state.get("human_decision")},
-    )
     return {
         "status": "approved",
+        "review_disposition": "approved",
         "messages": ["Human reviewer approved the exception."],
         "iteration_count": _next_iteration(state),
     }
 
 
 async def reject_node(state: WorkflowState) -> dict[str, Any]:
-    await log_audit_event(
-        state["run_id"],
-        "rejected",
-        payload={"human_decision": state.get("human_decision")},
-    )
     return {
         "status": "rejected",
+        "review_disposition": "rejected",
         "messages": ["Human reviewer rejected the exception."],
         "iteration_count": _next_iteration(state),
     }
 
 
 async def complete_node(state: WorkflowState) -> dict[str, Any]:
-    await log_audit_event(state["run_id"], "completed")
+    decision = state.get("human_decision")
+    unresolved_exception = bool(state.get("exception_reason")) and decision not in {
+        "approved",
+        "rejected",
+    }
+    if unresolved_exception:
+        await log_audit_event(
+            state["run_id"],
+            "failed",
+            payload={"reason": "unresolved_exception_circuit_breaker"},
+        )
+        return {
+            "status": "failed",
+            "processing_status": "failed",
+            "posting_status": "not_ready",
+            "messages": ["Workflow failed because an exception was not resolved."],
+            "iteration_count": _next_iteration(state),
+        }
+
+    legacy_status = decision if decision in {"approved", "rejected"} else "complete"
+    reconciliation_status = (state.get("match_result") or {}).get("reconciliation_status")
+    if decision == "approved" or (decision is None and reconciliation_status == "reconciled"):
+        posting_status = "ready_for_posting"
+    elif decision == "rejected":
+        posting_status = "blocked"
+    else:
+        posting_status = "not_ready"
+
+    # Review completion is persisted by the resume transaction. Avoid opening a
+    # second transaction here while that transaction holds the WorkflowRun row
+    # lock; PostgreSQL's FK check on workflow_audit_logs would otherwise wait on
+    # the same lock. Non-review runs retain the existing completion audit event.
+    if decision not in {"approved", "rejected"}:
+        await log_audit_event(
+            state["run_id"],
+            "completed",
+            payload={
+                "processing_status": "complete",
+                "posting_status": posting_status,
+            },
+        )
     return {
-        "status": "complete",
+        "status": legacy_status,
+        "processing_status": "complete",
+        "posting_status": posting_status,
         "messages": ["Workflow completed."],
         "iteration_count": _next_iteration(state),
     }

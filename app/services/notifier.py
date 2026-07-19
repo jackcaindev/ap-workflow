@@ -18,18 +18,41 @@ def _format_amount(amount: Any) -> str:
 
 
 def _build_summary_body(results: list[dict]) -> str:
-    auto_matched = [result for result in results if result.get("status") == "complete"]
-    needs_review = [result for result in results if result.get("status") == "awaiting_review"]
-    failed = [result for result in results if result.get("status") == "failed"]
+    ready = [result for result in results if result.get("posting_status") == "ready_for_posting"]
+    needs_review = [
+        result for result in results if result.get("processing_status") == "awaiting_review"
+    ]
+    rejected = [result for result in results if result.get("review_disposition") == "rejected"]
+    not_ready = [
+        result
+        for result in results
+        if result.get("processing_status") == "complete"
+        and result.get("posting_status") == "not_ready"
+    ]
+    failed = [result for result in results if result.get("processing_status") == "failed"]
 
     lines: list[str] = ["AP Workflow batch summary", ""]
 
-    lines.append("✅ Auto-matched")
-    if auto_matched:
-        for result in auto_matched:
+    lines.append("✅ Ready for Posting")
+    if ready:
+        for result in ready:
             carrier = result.get("carrier_name") or "Unknown carrier"
             amount = _format_amount(result.get("total_amount"))
             lines.append(f"- {result.get('filename')}: {carrier}, {amount}")
+    else:
+        lines.append("- None")
+
+    lines.extend(["", "⛔ Rejected / Blocked"])
+    if rejected:
+        for result in rejected:
+            lines.append(f"- {result.get('filename')} ({result.get('run_id')})")
+    else:
+        lines.append("- None")
+
+    lines.extend(["", "⏳ Processed, Not Ready"])
+    if not_ready:
+        for result in not_ready:
+            lines.append(f"- {result.get('filename')} ({result.get('run_id')})")
     else:
         lines.append("- None")
 
@@ -55,11 +78,24 @@ def _build_summary_body(results: list[dict]) -> str:
 def _notification_counts(results: list[dict]) -> dict[str, int]:
     return {
         "total_count": len(results),
-        "complete_count": sum(1 for result in results if result.get("status") == "complete"),
-        "awaiting_review_count": sum(
-            1 for result in results if result.get("status") == "awaiting_review"
+        "complete_count": sum(
+            1 for result in results if result.get("processing_status") == "complete"
         ),
-        "failed_count": sum(1 for result in results if result.get("status") == "failed"),
+        "awaiting_review_count": sum(
+            1 for result in results if result.get("processing_status") == "awaiting_review"
+        ),
+        "failed_count": sum(
+            1 for result in results if result.get("processing_status") == "failed"
+        ),
+        "approved_count": sum(
+            1 for result in results if result.get("review_disposition") == "approved"
+        ),
+        "rejected_count": sum(
+            1 for result in results if result.get("review_disposition") == "rejected"
+        ),
+        "ready_for_posting_count": sum(
+            1 for result in results if result.get("posting_status") == "ready_for_posting"
+        ),
     }
 
 
@@ -79,7 +115,9 @@ def _send_summary_email(results: list[dict]) -> bool:
 
     profile = service.users().getProfile(userId="me").execute()
     email_address = profile["emailAddress"]
-    review_count = sum(1 for result in results if result.get("status") == "awaiting_review")
+    review_count = sum(
+        1 for result in results if result.get("processing_status") == "awaiting_review"
+    )
 
     message = MIMEMultipart()
     message["From"] = email_address

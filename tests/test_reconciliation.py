@@ -11,7 +11,7 @@ async def test_reconcile_shipment_fully_reconciled(db_session, seeded_rate_confi
     assert shipment.reconciliation_status == "reconciled"
     assert result.exception_reasons == []
     assert result.missing_docs == []
-    assert all(check["passed"] for check in result.checks if check["check_name"] != "missing_docs")
+    assert all(check["outcome"] == "passed" for check in result.checks)
 
 
 async def test_reconcile_shipment_amount_variance_exception(db_session, seeded_rate_confirmations):
@@ -53,3 +53,10 @@ async def test_reconcile_shipment_partial_docs(db_session, seeded_rate_confirmat
     assert "bol" in result.missing_docs
     assert "pod" in result.missing_docs
     assert result.exception_reasons == []
+    assert all("passed" not in check for check in result.checks)
+    not_evaluated = {
+        check["check_name"]
+        for check in result.checks
+        if check["outcome"] == "not_evaluated"
+    }
+    assert {"bol_pickup_date", "pod_delivery_confirmation", "missing_docs"} <= not_evaluated

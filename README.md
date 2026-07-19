@@ -4,15 +4,15 @@ Freight AP Workflow automates accounts payable reconciliation for freight carrie
 
 ## Architecture
 
-The backend is a **FastAPI** service that orchestrates document processing through a **LangGraph** state machine with PostgreSQL-backed checkpoints. **PostgreSQL** stores shipments, documents, rate confirmations, reconciliation results, and workflow state. **Redis** decouples Gmail polling from invoice processing via a job queue.
+The backend is a **FastAPI** service that orchestrates document processing through a **LangGraph** state machine with PostgreSQL-backed checkpoints. **PostgreSQL** stores shipments, documents, rate confirmations, reconciliation results, and workflow state. **Redis Streams** decouple Gmail polling from invoice processing with acknowledged consumer-group delivery.
 
-On startup, the API runs two background tasks: a Gmail poller that enqueues attachment jobs every five minutes, and an invoice worker that dequeues jobs, runs the LangGraph workflow (extract → match/reconcile → optional human interrupt), and sends batch summary emails. A **React** UI (Vite + Tailwind) talks to the API for shipment dashboards, reconciliation detail, and human-in-the-loop approval.
+On startup, the API runs two background tasks: a Gmail poller that enqueues attachment jobs every five minutes, and an invoice worker that consumes stream deliveries, runs the LangGraph workflow (extract → match/reconcile → optional human interrupt), and sends batch summary emails. A **React** UI (Vite + Tailwind) talks to the API for shipment dashboards, reconciliation detail, and human-in-the-loop approval.
 
 ```
 Gmail Inbox
     │
     ▼
-Gmail Poller ──enqueue──▶ Redis (invoice_queue)
+Gmail Poller ──XADD──▶ Redis Stream (freight-ap:invoice-jobs:v1)
                               │
                               ▼
                         Invoice Worker
@@ -32,14 +32,14 @@ Gmail Poller ──enqueue──▶ Redis (invoice_queue)
 
 ## Features
 
-- Gmail ingestion with Redis job queue
+- Gmail ingestion with an acknowledged Redis Streams consumer group
 - Claude vision extraction for invoices, BOLs, and PODs
 - Automatic shipment assembly by load number
 - Full reconciliation: amount variance, carrier match, BOL pickup date, POD confirmation
 - Human-in-the-loop review for exceptions via LangGraph interrupt
 - Batch email summary notifications
 - React UI with shipment dashboard, reconciliation detail, and HITL approval
-- Eval suite with 13 passing tests
+- Backend suite covering extraction, workflow, reconciliation, shipments, and reliable delivery
 
 ## Local Development
 
@@ -117,9 +117,32 @@ Gmail Poller ──enqueue──▶ Redis (invoice_queue)
 
 ## Testing
 
+The default suite keeps the existing fast tests and fake-Redis worker tests. Run it
+against the development stack with:
+
 ```bash
-docker compose exec api pytest tests/ -v
+docker compose exec api pytest -m "not integration" tests/ -q
 ```
+
+The recovery suite uses its own PostgreSQL and Redis containers, random loopback
+ports, a unique Compose project, and disposable volumes. Redis is configured with
+AOF and `appendfsync=always`; one test restarts that isolated Redis container.
+
+```bash
+./scripts/test-integration.sh
+```
+
+Pass normal pytest selectors after the script to run a focused scenario:
+
+```bash
+./scripts/test-integration.sh tests/integration/test_delivery_recovery.py -k reclaim
+```
+
+The integration suite requires Docker Compose v2, Python 3.12, and `uv`. It must
+run serially (do not use pytest-xdist) because the AOF test restarts Redis. A warm
+run normally takes 25–60 seconds; the first run can take longer while images and
+Python dependencies download. The runner removes its containers, network, and
+volumes on exit, including after a test failure.
 
 ## Project Structure
 
@@ -150,8 +173,9 @@ app/
 ├── services/
 │   ├── extraction.py        # Claude vision classification and extraction
 │   ├── gmail_auth.py        # Gmail OAuth and service client
-│   ├── gmail_poller.py      # Inbox polling and Redis enqueue
-│   ├── invoice_worker.py    # Redis dequeue and LangGraph invocation
+│   ├── gmail_poller.py      # Inbox polling and Redis Streams enqueue
+│   ├── invoice_queue.py     # Stream/group, ACK, recovery, and DLQ operations
+│   ├── invoice_worker.py    # Consumer-group delivery and LangGraph invocation
 │   ├── matching.py          # Invoice-to-rate-confirmation amount matching
 │   ├── notifier.py          # Batch summary email via Gmail
 │   ├── reconciliation.py    # Full shipment reconciliation checks
@@ -166,8 +190,16 @@ app/
 
 **LangGraph for human-in-the-loop.** Reconciliation exceptions need to pause processing until an AP clerk approves or rejects the variance. LangGraph's `interrupt()` mechanism checkpoints workflow state in PostgreSQL and resumes via `Command(resume=...)` when the UI calls `POST /workflow/{run_id}/resume`. This gives durable, restart-safe HITL without building custom pause/resume infrastructure — the graph encodes the happy path and exception branches, and the checkpointer preserves state across API restarts.
 
-**Redis queue decouples polling from processing.** Gmail polling is I/O-bound and runs on a fixed interval; invoice processing is slow (Claude API calls, DB writes, reconciliation). Pushing attachment payloads onto a Redis list (`invoice_queue`) lets the poller finish quickly after enqueueing, while the worker consumes jobs at its own pace. If processing backs up, messages accumulate in Redis rather than blocking the poller or timing out Gmail API calls.
+**Redis Streams provide recoverable at-least-once delivery.** Each Gmail MIME attachment gets a stable key from its mailbox, message ID, and MIME part ID, then is atomically deduplicated and appended to the stream. A consumer acknowledges the entry only after its workflow state commits to PostgreSQL. If the worker exits first, the entry stays pending and another consumer reclaims it after the visibility timeout.
+
+Delivery is at least once, not exactly once: PostgreSQL and Redis do not share a transaction. PostgreSQL therefore enforces a unique attachment source key and deterministic workflow run ID, so redelivery after a database commit but before `XACK` reuses the existing document and workflow. Reconciliation results and workflow audit events are idempotent per run. Active jobs heartbeat their leases; transient failures remain pending and are reclaimed up to `INVOICE_MAX_ATTEMPTS` (three by default). The final failed attempt and malformed payloads are copied to `freight-ap:invoice-jobs:dlq:v1`, including their original fields and failure reason, before the source entry is acknowledged.
+
+Reads are bounded by `MAX_BATCH_SIZE`, but each entry is processed, acknowledged, retried, or dead-lettered independently. One failed attachment therefore does not block its siblings. Docker Compose enables Redis append-only persistence. Queue age is available from `enqueued_at`, Redis pending delivery count is the attempt count, and retry metadata retains the latest failure reason.
 
 **Partial reconciliation on incomplete document sets.** Freight paperwork arrives asynchronously — an invoice may show up days before the BOL or POD. Rather than waiting for all four documents, reconciliation runs on whatever is present and marks checks as skipped when required data is missing. Shipments get a `partial` status when docs are still outstanding and `exception` only when a present document fails a check (or a POD is overdue past a 3-day grace period). This gives operations useful status early instead of a binary "not ready" state.
+
+**Business state is multidimensional.** Workflow processing (`pending` through `complete` or `failed`), shipment reconciliation (`pending`, `partial`, `reconciled`, or `exception`), immutable human disposition (`approved` or `rejected`), and downstream posting/payment state are persisted separately. An approved exception remains an exceptional reconciliation with an explicit business override; it becomes `ready_for_posting` without pretending the shipment reconciled. Rejected work is `blocked`. The legacy run `status` remains a compatibility projection, so `complete_node` can no longer erase an approval or rejection.
+
+Reconciliation checks use `passed`, `failed`, or `not_evaluated`. Missing prerequisites and grace-period checks are never reported as successful. Review decisions are serialized with a PostgreSQL row lock, persisted once, and safely replayed from the LangGraph checkpoint after a narrow checkpoint/database crash window. This does not change the Redis Streams at-least-once boundary, deterministic job identity, ACK timing, retries, or DLQ behavior described above.
 
 **Doc-type-aware extraction schemas.** Invoices, BOLs, PODs, and rate confirmations have different fields — line items and amounts on invoices, pickup dates on BOLs, delivery condition on PODs. A single universal schema would force nullable fields for every doc type and degrade extraction accuracy. Instead, Claude first classifies the document, then uses a type-specific prompt and Pydantic schema (`InvoiceExtraction`, `BOLExtraction`, `PODExtraction`) to validate structured output. Rate confirmations reuse the invoice schema shape for compatibility with the existing extraction pipeline.

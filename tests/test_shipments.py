@@ -50,3 +50,18 @@ async def test_shipment_detail_populates_manual_rate_con(
     assert extracted["origin"] == rate_con.origin
     assert extracted["destination"] == rate_con.destination
     assert extracted["shipment_date"] == rate_con.shipment_date.isoformat()
+
+
+async def test_carrier_analytics_exposes_business_state_counts(
+    client, db_session, seeded_rate_confirmations
+):
+    await create_shipment_with_documents(db_session)
+
+    response = await client.get("/analytics/carriers")
+
+    assert response.status_code == 200
+    row = response.json()[0]
+    assert row["pending_review_count"] == 0
+    assert row["approved_count"] == 0
+    assert row["rejected_count"] == 0
+    assert row["ready_for_posting_count"] == 0

@@ -23,6 +23,9 @@ async def notifications(db: AsyncSession = Depends(get_session)) -> list[dict]:
             "complete_count": notification.complete_count,
             "awaiting_review_count": notification.awaiting_review_count,
             "failed_count": notification.failed_count,
+            "approved_count": notification.approved_count,
+            "rejected_count": notification.rejected_count,
+            "ready_for_posting_count": notification.ready_for_posting_count,
         }
         for notification in result.scalars()
     ]

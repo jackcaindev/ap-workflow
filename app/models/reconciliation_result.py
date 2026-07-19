@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy import DateTime, ForeignKey, Index, String, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PostgresUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -15,6 +15,14 @@ if TYPE_CHECKING:
 
 class ReconciliationResult(Base):
     __tablename__ = "reconciliation_results"
+    __table_args__ = (
+        Index(
+            "uq_reconciliation_results_run_id",
+            "run_id",
+            unique=True,
+            postgresql_where=text("run_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid4)
     shipment_id: Mapped[UUID] = mapped_column(

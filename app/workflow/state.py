@@ -1,5 +1,5 @@
 import operator
-from typing import Annotated, TypedDict
+from typing import Annotated, NotRequired, TypedDict
 
 
 class WorkflowState(TypedDict):
@@ -15,6 +15,9 @@ class WorkflowState(TypedDict):
     triage_confidence: float | None
     human_decision: str | None
     status: str
+    processing_status: NotRequired[str]
+    posting_status: NotRequired[str]
+    review_disposition: NotRequired[str]
     # LangGraph applies the reducer when multiple nodes update this field, so
     # nodes can append audit messages without re-sending the full message list.
     messages: Annotated[list[str], operator.add]

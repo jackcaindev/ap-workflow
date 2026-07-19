@@ -13,6 +13,15 @@ class Settings(BaseSettings):
     GMAIL_CREDENTIALS_PATH: str = "/app/credentials.json"
     GMAIL_TOKEN_PATH: str = "/app/token.json"
     REDIS_URL: str = "redis://localhost:6379/0"
+    INVOICE_STREAM: str = "freight-ap:invoice-jobs:v1"
+    INVOICE_CONSUMER_GROUP: str = "freight-ap:invoice-workers:v1"
+    INVOICE_DEAD_LETTER_STREAM: str = "freight-ap:invoice-jobs:dlq:v1"
+    INVOICE_DEDUPE_PREFIX: str = "freight-ap:invoice-dedupe"
+    INVOICE_METADATA_PREFIX: str = "freight-ap:invoice-meta"
+    INVOICE_MAX_ATTEMPTS: int = 3
+    INVOICE_VISIBILITY_TIMEOUT_MS: int = 300_000
+    INVOICE_READ_BLOCK_MS: int = 5_000
+    INVOICE_DEDUPE_TTL_SECONDS: int = 30 * 24 * 60 * 60
     # A bounded fan-out limits simultaneous Claude requests, SQLAlchemy
     # sessions, and per-document LangGraph checkpointer connections.
     MAX_BATCH_SIZE: int = 10

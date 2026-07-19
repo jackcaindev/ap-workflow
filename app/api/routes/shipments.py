@@ -9,7 +9,9 @@ from app.database import get_session
 from app.models.document import Document
 from app.models.rate_confirmation import RateConfirmation
 from app.models.reconciliation_result import ReconciliationResult
+from app.models.review_decision import ReviewDecision
 from app.models.shipment import Shipment
+from app.models.workflow_run import WorkflowRun
 
 
 router = APIRouter(tags=["shipments"])
@@ -146,6 +148,20 @@ async def carrier_analytics(db: AsyncSession = Depends(get_session)) -> list[dic
     for result in reconciliation_result.scalars():
         latest_by_shipment.setdefault(result.shipment_id, result)
 
+    latest_run_ids = {
+        result.run_id for result in latest_by_shipment.values() if result.run_id is not None
+    }
+    run_state_by_id: dict[str, tuple[WorkflowRun, ReviewDecision | None]] = {}
+    if latest_run_ids:
+        runs_result = await db.execute(
+            select(WorkflowRun, ReviewDecision)
+            .outerjoin(ReviewDecision, ReviewDecision.run_id == WorkflowRun.run_id)
+            .where(WorkflowRun.run_id.in_(latest_run_ids))
+        )
+        run_state_by_id = {
+            run.run_id: (run, decision) for run, decision in runs_result.all()
+        }
+
     grouped: dict[str, list[Shipment]] = defaultdict(list)
     for shipment in shipments:
         grouped[shipment.carrier_name or "Unknown carrier"].append(shipment)
@@ -165,6 +181,26 @@ async def carrier_analytics(db: AsyncSession = Depends(get_session)) -> list[dic
                 reasons.update(latest.exception_reasons or [])
 
         exception_count = len(exception_shipments)
+        pending_review_count = 0
+        approved_count = 0
+        rejected_count = 0
+        ready_for_posting_count = 0
+        for shipment in carrier_shipments:
+            latest = latest_by_shipment.get(shipment.id)
+            if latest is None or latest.run_id is None:
+                continue
+            run_state = run_state_by_id.get(latest.run_id)
+            if run_state is None:
+                continue
+            run, decision = run_state
+            if run.processing_status == "awaiting_review" and decision is None:
+                pending_review_count += 1
+            if decision is not None and decision.disposition == "approved":
+                approved_count += 1
+            if decision is not None and decision.disposition == "rejected":
+                rejected_count += 1
+            if run.posting_status == "ready_for_posting":
+                ready_for_posting_count += 1
         rows.append(
             {
                 "carrier_name": carrier_name,
@@ -174,6 +210,10 @@ async def carrier_analytics(db: AsyncSession = Depends(get_session)) -> list[dic
                 "most_common_exception_type": reasons.most_common(1)[0][0]
                 if reasons
                 else None,
+                "pending_review_count": pending_review_count,
+                "approved_count": approved_count,
+                "rejected_count": rejected_count,
+                "ready_for_posting_count": ready_for_posting_count,
             }
         )
 

@@ -1,17 +1,23 @@
-from typing import Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from langgraph.types import Command
-from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
 from app.models.document import Document
 from app.models.reconciliation_result import ReconciliationResult
+from app.models.review_decision import ReviewDecision
+from app.models.shipment import Shipment
 from app.models.workflow_audit_log import WorkflowAuditLog
 from app.models.workflow_run import WorkflowRun
+from app.schemas.workflow import ResumeRequest
+from app.services.business_state import (
+    BusinessStateConflict,
+    decide_review,
+    reconciliation_status_for_run,
+    state_payload,
+)
 from app.services.extraction import (
     ExtractionError,
     UnsupportedFileTypeError,
@@ -21,10 +27,6 @@ from app.workflow.graph import workflow_graph
 
 
 router = APIRouter(prefix="/workflow", tags=["workflow"])
-
-
-class ResumeRequest(BaseModel):
-    decision: Literal["approved", "rejected"]
 
 
 def _extracted_carrier(extraction: dict | None) -> str | None:
@@ -72,7 +74,7 @@ def _run_sort_key(run: dict) -> tuple[int, int, object]:
         "escalate_standard": 1,
         "auto_resolve": 2,
     }
-    review_priority = 0 if run.get("status") == "awaiting_review" else 1
+    review_priority = 0 if run.get("processing_status") == "awaiting_review" else 1
     route = run.get("triage_route")
     route_rank = triage_priority.get(route, 3) if route else 3
     return (review_priority, route_rank, run.get("created_at"))
@@ -94,32 +96,49 @@ async def get_workflow_run(db: AsyncSession, run_id: str) -> WorkflowRun | None:
     return result.scalar_one_or_none()
 
 
+async def get_review_decision(db: AsyncSession, run_id: str) -> ReviewDecision | None:
+    result = await db.execute(
+        select(ReviewDecision).where(ReviewDecision.run_id == run_id)
+    )
+    return result.scalar_one_or_none()
+
+
 async def persist_run_state(
     db: AsyncSession,
     run: WorkflowRun,
     *,
     status_value: str,
+    processing_status: str | None = None,
+    posting_status: str | None = None,
     payload: dict | None = None,
+    preserve_payload: bool = False,
 ) -> None:
     run.status = status_value
-    run.interrupt_payload = payload
+    run.processing_status = processing_status or status_value
+    if posting_status is not None:
+        run.posting_status = posting_status
+    if not preserve_payload:
+        run.interrupt_payload = payload
     await db.commit()
 
 
 @router.get("/runs")
 async def workflow_runs(db: AsyncSession = Depends(get_session)) -> list[dict]:
     result = await db.execute(
-        select(WorkflowRun, Document)
+        select(WorkflowRun, Document, ReviewDecision)
         .join(Document, WorkflowRun.document_id == Document.id)
+        .outerjoin(ReviewDecision, ReviewDecision.run_id == WorkflowRun.run_id)
         .order_by(WorkflowRun.created_at.desc())
         .limit(20)
     )
 
     runs = []
-    for run, document in result.all():
+    for run, document, decision in result.all():
         extraction = document.extracted_data or {}
         total_amount = _extracted_amount(extraction)
         doc_type = extraction.get("doc_type") or document.doc_type
+        reconciliation_status = await reconciliation_status_for_run(db, run.run_id)
+        business_state = state_payload(run, decision, reconciliation_status)
         runs.append(
             {
                 "run_id": run.run_id,
@@ -128,7 +147,7 @@ async def workflow_runs(db: AsyncSession = Depends(get_session)) -> list[dict]:
                 "carrier_name": _extracted_carrier(extraction),
                 "amount": total_amount,
                 "total_amount": total_amount,
-                "status": run.status,
+                **business_state,
                 "created_at": run.created_at,
                 **_triage_from_payload(run.interrupt_payload),
             }
@@ -141,7 +160,7 @@ async def workflow_runs(db: AsyncSession = Depends(get_session)) -> list[dict]:
 async def run_workflow(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_session),
-) -> dict[str, str]:
+) -> dict:
     file_bytes = await file.read()
     try:
         # Validate the extension before creating workflow rows. The extraction
@@ -171,6 +190,8 @@ async def run_workflow(
         run_id=run_id,
         document_id=document.id,
         status="running",
+        processing_status="running",
+        posting_status="not_ready",
         interrupt_payload=None,
     )
     db.add(run)
@@ -189,6 +210,8 @@ async def run_workflow(
         "triage_confidence": None,
         "human_decision": None,
         "status": "running",
+        "processing_status": "running",
+        "posting_status": "not_ready",
         "messages": [],
         "iteration_count": 0,
     }
@@ -200,6 +223,7 @@ async def run_workflow(
             db,
             run,
             status_value="failed",
+            processing_status="failed",
             payload={"error": str(exc)},
         )
         raise HTTPException(
@@ -211,17 +235,32 @@ async def run_workflow(
             db,
             run,
             status_value="failed",
+            processing_status="failed",
             payload={"error": str(exc)},
         )
         raise
     payload = interrupt_payload(result)
     if payload is not None:
-        await persist_run_state(db, run, status_value="awaiting_review", payload=payload)
-        return {"run_id": run_id, "status": "awaiting_review"}
+        await persist_run_state(
+            db,
+            run,
+            status_value="awaiting_review",
+            processing_status="awaiting_review",
+            posting_status="not_ready",
+            payload=payload,
+        )
+        return state_payload(run, None, await reconciliation_status_for_run(db, run_id))
 
     final_status = result.get("status", "complete")
-    await persist_run_state(db, run, status_value=final_status)
-    return {"run_id": run_id, "status": final_status}
+    await persist_run_state(
+        db,
+        run,
+        status_value=final_status,
+        processing_status=result.get("processing_status", "complete"),
+        posting_status=result.get("posting_status", "not_ready"),
+        preserve_payload=True,
+    )
+    return state_payload(run, None, await reconciliation_status_for_run(db, run_id))
 
 
 @router.get("/{run_id}")
@@ -244,6 +283,7 @@ async def workflow_detail(run_id: str, db: AsyncSession = Depends(get_session)) 
         .limit(1)
     )
     reconciliation = reconciliation_result.scalar_one_or_none()
+    decision = await get_review_decision(db, run.run_id)
     match_result = None if reconciliation is None else {
         "matched": not reconciliation.exception_reasons,
         "reconciliation_result_id": str(reconciliation.id),
@@ -256,9 +296,18 @@ async def workflow_detail(run_id: str, db: AsyncSession = Depends(get_session)) 
     triage = _triage_from_payload(run.interrupt_payload)
 
     return {
-        "run_id": run.run_id,
+        **state_payload(
+            run,
+            decision,
+            None if reconciliation is None else (
+                await db.scalar(
+                    select(Shipment.reconciliation_status).where(
+                        Shipment.id == reconciliation.shipment_id
+                    )
+                )
+            ),
+        ),
         "filename": document.filename,
-        "status": run.status,
         "created_at": run.created_at,
         "updated_at": run.updated_at,
         "extraction": extraction,
@@ -274,23 +323,28 @@ async def resume_workflow(
     run_id: str,
     request: ResumeRequest,
     db: AsyncSession = Depends(get_session),
-) -> dict[str, str]:
-    run = await get_workflow_run(db, run_id)
-    if run is None:
+) -> dict:
+    try:
+        run, decision, idempotent = await decide_review(db, run_id, request.decision)
+    except BusinessStateConflict as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": exc.code,
+                "message": exc.message,
+                **(exc.details or {}),
+            },
+        ) from exc
+    if run is None or decision is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow run not found")
-
-    result = await workflow_graph.ainvoke(
-        Command(resume=request.decision),
-        config=graph_config(run_id),
+    response = state_payload(
+        run,
+        decision,
+        await reconciliation_status_for_run(db, run_id),
     )
-    payload = interrupt_payload(result)
-    if payload is not None:
-        await persist_run_state(db, run, status_value="awaiting_review", payload=payload)
-        return {"run_id": run_id, "status": "awaiting_review"}
-
-    final_status = result.get("status", "complete")
-    await persist_run_state(db, run, status_value=final_status)
-    return {"run_id": run_id, "status": final_status}
+    response["idempotent"] = idempotent
+    return response
 
 
 @router.get("/{run_id}/audit")
@@ -324,7 +378,12 @@ async def workflow_status(run_id: str, db: AsyncSession = Depends(get_session)) 
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow run not found")
 
-    response = {"run_id": run_id, "status": run.status}
-    if run.status == "awaiting_review":
+    decision = await get_review_decision(db, run_id)
+    response = state_payload(
+        run,
+        decision,
+        await reconciliation_status_for_run(db, run_id),
+    )
+    if run.processing_status == "awaiting_review":
         response["interrupt_payload"] = run.interrupt_payload
     return response

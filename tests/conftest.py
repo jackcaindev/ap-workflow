@@ -71,6 +71,7 @@ SAMPLE_INVOICE_PDF = FIXTURES_DIR / "sample_invoice.pdf"
 TRUNCATE_TABLES_SQL = """
 TRUNCATE TABLE
     workflow_audit_logs,
+    review_decisions,
     reconciliation_results,
     workflow_runs,
     documents,
