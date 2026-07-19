@@ -39,6 +39,7 @@ Gmail Poller ──XADD──▶ Redis Stream (freight-ap:invoice-jobs:v1)
 - Human-in-the-loop review for exceptions via LangGraph interrupt
 - Batch email summary notifications
 - React UI with shipment dashboard, reconciliation detail, and HITL approval
+- Explicit DLQ listing, idempotent replay, queue metrics, and age-based retention controls
 - Backend suite covering extraction, workflow, reconciliation, shipments, and reliable delivery
 
 ## Local Development
@@ -193,6 +194,13 @@ app/
 **Redis Streams provide recoverable at-least-once delivery.** Each Gmail MIME attachment gets a stable key from its mailbox, message ID, and MIME part ID, then is atomically deduplicated and appended to the stream. A consumer acknowledges the entry only after its workflow state commits to PostgreSQL. If the worker exits first, the entry stays pending and another consumer reclaims it after the visibility timeout.
 
 Delivery is at least once, not exactly once: PostgreSQL and Redis do not share a transaction. PostgreSQL therefore enforces a unique attachment source key and deterministic workflow run ID, so redelivery after a database commit but before `XACK` reuses the existing document and workflow. Reconciliation results and workflow audit events are idempotent per run. Active jobs heartbeat their leases; transient failures remain pending and are reclaimed up to `INVOICE_MAX_ATTEMPTS` (three by default). The final failed attempt and malformed payloads are copied to `freight-ap:invoice-jobs:dlq:v1`, including their original fields and failure reason, before the source entry is acknowledged.
+
+The Queue Operations API and React view are intentionally unauthenticated controls for
+the trusted, single-user local demo. Operators can list retained DLQ evidence, request an
+idempotent replay with a UUID request key, inspect queue metrics, or explicitly purge
+entries older than a supplied cutoff. Replay preserves the original source identity and
+bypasses only the potentially stale Redis enqueue-dedupe key; enqueueing or acknowledging
+a replay does not prove successful business processing, approval, posting, or payment.
 
 Reads are bounded by `MAX_BATCH_SIZE`, but each entry is processed, acknowledged, retried, or dead-lettered independently. One failed attachment therefore does not block its siblings. Docker Compose enables Redis append-only persistence. Queue age is available from `enqueued_at`, Redis pending delivery count is the attempt count, and retry metadata retains the latest failure reason.
 

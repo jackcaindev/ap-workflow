@@ -26,6 +26,38 @@ class StreamDelivery:
     fields: dict[str, str]
     attempt: int = 1
 
+    @property
+    def replay_context(self) -> tuple[str, str] | None:
+        dlq_id = self.fields.get("replay_dlq_id")
+        request_id = self.fields.get("replay_request_id")
+        if dlq_id and request_id:
+            return dlq_id, request_id
+        return None
+
+
+def _replay_metadata_key(replay_prefix: str, delivery: StreamDelivery) -> str | None:
+    context = delivery.replay_context
+    return f"{replay_prefix}:{context[0]}" if context else None
+
+
+def _replay_action_fields(
+    delivery: StreamDelivery,
+    *,
+    state: str,
+    workflow_processing_status: str | None = None,
+) -> dict[str, str]:
+    context = delivery.replay_context
+    if context is None:
+        return {}
+    action_prefix = f"action:{context[1]}:"
+    fields = {
+        f"{action_prefix}state": state,
+        f"{action_prefix}processing_updated_at": datetime.now(UTC).isoformat(),
+    }
+    if workflow_processing_status is not None:
+        fields[f"{action_prefix}workflow_processing_status"] = workflow_processing_status
+    return fields
+
 
 def parse_delivery(delivery: StreamDelivery) -> InvoiceJobEnvelope:
     raw_payload = delivery.fields.get("payload")
@@ -129,24 +161,68 @@ async def record_failure(
     metadata_prefix: str,
     delivery: StreamDelivery,
     reason: str,
+    replay_prefix: str | None = None,
 ) -> None:
-    await redis.hset(
-        f"{metadata_prefix}:{delivery.stream_id}",
-        mapping={
-            "state": "retrying",
-            "attempt_count": delivery.attempt,
-            "last_failure_reason": reason[:2000],
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
-    )
+    failure_fields = {
+        "state": "retrying",
+        "attempt_count": delivery.attempt,
+        "last_failure_reason": reason[:2000],
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    replay_key = _replay_metadata_key(replay_prefix, delivery) if replay_prefix else None
+    if replay_key is None:
+        await redis.hset(f"{metadata_prefix}:{delivery.stream_id}", mapping=failure_fields)
+        return
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.hset(f"{metadata_prefix}:{delivery.stream_id}", mapping=failure_fields)
+        pipe.hset(
+            replay_key,
+            mapping=_replay_action_fields(delivery, state="retrying"),
+        )
+        await pipe.execute()
+
+
+async def record_replay_processing(
+    redis: Redis,
+    *,
+    replay_prefix: str,
+    delivery: StreamDelivery,
+) -> None:
+    replay_key = _replay_metadata_key(replay_prefix, delivery)
+    if replay_key is not None:
+        await redis.hset(
+            replay_key,
+            mapping=_replay_action_fields(delivery, state="processing"),
+        )
 
 
 async def acknowledge(
-    redis: Redis, *, stream: str, group: str, stream_id: str
+    redis: Redis,
+    *,
+    stream: str,
+    group: str,
+    stream_id: str,
+    delivery: StreamDelivery | None = None,
+    replay_prefix: str | None = None,
+    workflow_processing_status: str | None = None,
 ) -> None:
     async with redis.pipeline(transaction=True) as pipe:
         pipe.xack(stream, group, stream_id)
         pipe.xdel(stream, stream_id)
+        replay_key = (
+            _replay_metadata_key(replay_prefix, delivery)
+            if replay_prefix and delivery is not None
+            else None
+        )
+        if replay_key is not None:
+            pipe.hset(
+                replay_key,
+                mapping=_replay_action_fields(
+                    delivery,
+                    state="acknowledged",
+                    workflow_processing_status=workflow_processing_status,
+                ),
+            )
         await pipe.execute()
 
 
@@ -158,6 +234,7 @@ async def dead_letter(
     dead_letter_stream: str,
     delivery: StreamDelivery,
     reason: str,
+    replay_prefix: str | None = None,
 ) -> None:
     fields = {
         "original_stream_id": delivery.stream_id,
@@ -170,4 +247,14 @@ async def dead_letter(
         pipe.xadd(dead_letter_stream, fields)
         pipe.xack(stream, group, delivery.stream_id)
         pipe.xdel(stream, delivery.stream_id)
+        replay_key = _replay_metadata_key(replay_prefix, delivery) if replay_prefix else None
+        if replay_key is not None:
+            pipe.hset(
+                replay_key,
+                mapping=_replay_action_fields(
+                    delivery,
+                    state="dead_lettered",
+                    workflow_processing_status="failed",
+                ),
+            )
         await pipe.execute()

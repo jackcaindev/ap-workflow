@@ -36,6 +36,9 @@ class FakePipeline:
     def xdel(self, stream: str, stream_id: str) -> None:
         self.commands.append(("xdel", stream, stream_id))
 
+    def hset(self, key: str, mapping: dict) -> None:
+        self.commands.append(("hset", key, mapping))
+
     async def execute(self) -> list[int]:
         self.redis.operations.extend(self.commands)
         return [1] * len(self.commands)
@@ -72,6 +75,7 @@ def settings(**overrides):
         "INVOICE_CONSUMER_GROUP": "workers",
         "INVOICE_DEAD_LETTER_STREAM": "jobs-dlq",
         "INVOICE_METADATA_PREFIX": "job-meta",
+        "INVOICE_DLQ_REPLAY_PREFIX": "job-replays",
         "INVOICE_MAX_ATTEMPTS": 3,
         "INVOICE_VISIBILITY_TIMEOUT_MS": 300_000,
     }
@@ -218,6 +222,88 @@ async def test_redelivery_after_review_short_circuits_graph_and_acknowledges(mon
         "xack",
         "xdel",
     ]
+
+
+async def test_operator_replay_restarts_failed_run_without_changing_source_identity(monkeypatch):
+    job = make_job(suffix="operator-restart")
+    document, created_run = await invoice_worker._get_or_create_job_records(job)
+    async with AsyncSessionLocal() as db:
+        run = await db.scalar(
+            select(WorkflowRun).where(WorkflowRun.run_id == created_run.run_id)
+        )
+        run.status = "failed"
+        run.processing_status = "failed"
+        run.interrupt_payload = {"error": "provider unavailable"}
+        await db.commit()
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        await invoice_worker._run_workflow_for_job(job)
+
+    async def empty_state(_config):
+        return SimpleNamespace(values={}, next=())
+
+    async def completed_graph(graph_input, *, config):
+        assert graph_input["document_id"] == str(document.id)
+        assert graph_input["run_id"] == created_run.run_id
+        return {
+            **graph_input,
+            "status": "complete",
+            "processing_status": "complete",
+            "posting_status": "ready_for_posting",
+        }
+
+    monkeypatch.setattr(invoice_worker.workflow_graph, "aget_state", empty_state)
+    monkeypatch.setattr(invoice_worker.workflow_graph, "ainvoke", completed_graph)
+
+    result = await invoice_worker._run_workflow_for_job(job, operator_replay=True)
+
+    assert result["processing_status"] == "complete"
+    async with AsyncSessionLocal() as db:
+        replayed_run = await db.scalar(
+            select(WorkflowRun).where(WorkflowRun.run_id == created_run.run_id)
+        )
+        replayed_document = await db.scalar(
+            select(Document).where(Document.id == document.id)
+        )
+        assert replayed_run.processing_status == "complete"
+        assert replayed_document.source_idempotency_key == job.idempotency_key
+
+
+async def test_replay_delivery_records_processing_and_acknowledged_outcome(monkeypatch):
+    redis = FakeRedis()
+    job = make_job(suffix="replay-lifecycle")
+    replay_delivery = StreamDelivery(
+        "7-0",
+        {
+            "payload": job.model_dump_json(),
+            "replay_dlq_id": "6-0",
+            "replay_request_id": "request-1",
+        },
+    )
+
+    async def complete(_job: InvoiceJobEnvelope, *, operator_replay: bool = False):
+        assert operator_replay is True
+        return invoice_worker._summary_result(
+            filename=job.filename, run_id="run-1", status="complete"
+        )
+
+    monkeypatch.setattr(invoice_worker, "_run_workflow_for_job", complete)
+    result = await invoice_worker._process_delivery(
+        redis, replay_delivery, settings(), "consumer-a"
+    )
+
+    assert result["processing_status"] == "complete"
+    replay_updates = [
+        operation[2]
+        for operation in redis.operations
+        if operation[0] == "hset" and operation[1] == "job-replays:6-0"
+    ]
+    assert any(fields["action:request-1:state"] == "processing" for fields in replay_updates)
+    assert any(fields["action:request-1:state"] == "acknowledged" for fields in replay_updates)
+    assert any(
+        fields.get("action:request-1:workflow_processing_status") == "complete"
+        for fields in replay_updates
+    )
 
 
 async def test_transient_failures_retry_up_to_limit(monkeypatch):

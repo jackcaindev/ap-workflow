@@ -27,6 +27,7 @@ class QueueNames:
     group: str
     dead_letter_stream: str
     metadata_prefix: str
+    replay_prefix: str
 
 
 @pytest.fixture
@@ -38,6 +39,7 @@ def queue_names() -> QueueNames:
         group=f"{namespace}:workers",
         dead_letter_stream=f"{namespace}:dlq",
         metadata_prefix=f"{namespace}:metadata",
+        replay_prefix=f"{namespace}:replays",
     )
 
 
@@ -48,6 +50,7 @@ def worker_settings(queue_names: QueueNames) -> SimpleNamespace:
         INVOICE_CONSUMER_GROUP=queue_names.group,
         INVOICE_DEAD_LETTER_STREAM=queue_names.dead_letter_stream,
         INVOICE_METADATA_PREFIX=queue_names.metadata_prefix,
+        INVOICE_DLQ_REPLAY_PREFIX=queue_names.replay_prefix,
         INVOICE_MAX_ATTEMPTS=3,
         INVOICE_VISIBILITY_TIMEOUT_MS=100,
     )

@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     INVOICE_DEAD_LETTER_STREAM: str = "freight-ap:invoice-jobs:dlq:v1"
     INVOICE_DEDUPE_PREFIX: str = "freight-ap:invoice-dedupe"
     INVOICE_METADATA_PREFIX: str = "freight-ap:invoice-meta"
+    INVOICE_DLQ_REPLAY_PREFIX: str = "freight-ap:invoice-dlq-replay:v1"
+    INVOICE_DLQ_RETENTION_MAX_DELETE: int = 1_000
     INVOICE_MAX_ATTEMPTS: int = 3
     INVOICE_VISIBILITY_TIMEOUT_MS: int = 300_000
     INVOICE_READ_BLOCK_MS: int = 5_000

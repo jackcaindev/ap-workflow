@@ -53,6 +53,7 @@ from fastapi import FastAPI
 
 from app.api.routes.extraction import router as extraction_router
 from app.api.routes.rate_confirmations import router as rate_confirmations_router
+from app.api.routes.queue_operations import router as queue_operations_router
 from app.api.routes.shipments import router as shipments_router
 from app.api.routes.workflow import router as workflow_router
 from app.models.document import Document
@@ -62,6 +63,7 @@ from app.models.shipment import Shipment
 test_app = FastAPI(title="Freight AP Workflow API", version="0.1.0")
 test_app.include_router(extraction_router)
 test_app.include_router(rate_confirmations_router)
+test_app.include_router(queue_operations_router)
 test_app.include_router(shipments_router)
 test_app.include_router(workflow_router)
 

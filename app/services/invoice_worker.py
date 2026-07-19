@@ -26,6 +26,7 @@ from app.services.invoice_queue import (
     parse_delivery,
     read_new_batch,
     record_failure,
+    record_replay_processing,
 )
 from app.services.notifier import send_batch_summary
 from app.workflow.graph import workflow_graph
@@ -174,10 +175,12 @@ async def _get_or_create_job_records(
         return document, run
 
 
-async def _run_workflow_for_job(job: InvoiceJobEnvelope) -> dict[str, Any]:
+async def _run_workflow_for_job(
+    job: InvoiceJobEnvelope, *, operator_replay: bool = False
+) -> dict[str, Any]:
     document, existing_run = await _get_or_create_job_records(job)
     run_id = existing_run.run_id
-    if existing_run.processing_status == "failed":
+    if existing_run.processing_status == "failed" and not operator_replay:
         payload = existing_run.interrupt_payload or {}
         raise RuntimeError(payload.get("error") or "workflow previously failed")
     if existing_run.processing_status in REDELIVERY_SHORT_CIRCUIT_PROCESSING_STATUSES:
@@ -216,6 +219,15 @@ async def _run_workflow_for_job(job: InvoiceJobEnvelope) -> dict[str, Any]:
             select(WorkflowRun).where(WorkflowRun.run_id == run_id)
         )
         run = run_result.scalar_one()
+        if operator_replay and run.processing_status == "failed":
+            await persist_run_state(
+                run,
+                status_value="retrying",
+                processing_status="retrying",
+                posting_status="not_ready",
+                preserve_payload=True,
+            )
+            await db.commit()
         try:
             config = graph_config(run_id)
             snapshot = await workflow_graph.aget_state(config)
@@ -342,9 +354,17 @@ async def _process_delivery(
             dead_letter_stream=settings.INVOICE_DEAD_LETTER_STREAM,
             delivery=delivery,
             reason=str(exc),
+            replay_prefix=settings.INVOICE_DLQ_REPLAY_PREFIX,
         )
         return _summary_result(
             filename="unknown", run_id="", status="failed", exception_reason=str(exc)
+        )
+
+    if delivery.replay_context is not None:
+        await record_replay_processing(
+            redis,
+            replay_prefix=settings.INVOICE_DLQ_REPLAY_PREFIX,
+            delivery=delivery,
         )
 
     queue_age_seconds = max(
@@ -359,7 +379,10 @@ async def _process_delivery(
     )
     heartbeat = asyncio.create_task(_heartbeat(redis, delivery, settings, consumer))
     try:
-        result = await _run_workflow_for_job(job)
+        if delivery.replay_context is None:
+            result = await _run_workflow_for_job(job)
+        else:
+            result = await _run_workflow_for_job(job, operator_replay=True)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -373,6 +396,7 @@ async def _process_delivery(
                 dead_letter_stream=settings.INVOICE_DEAD_LETTER_STREAM,
                 delivery=delivery,
                 reason=reason,
+                replay_prefix=settings.INVOICE_DLQ_REPLAY_PREFIX,
             )
             return _summary_result(
                 filename=job.filename,
@@ -385,6 +409,7 @@ async def _process_delivery(
             metadata_prefix=settings.INVOICE_METADATA_PREFIX,
             delivery=delivery,
             reason=reason,
+            replay_prefix=settings.INVOICE_DLQ_REPLAY_PREFIX,
         )
         return None
     finally:
@@ -397,6 +422,9 @@ async def _process_delivery(
         stream=settings.INVOICE_STREAM,
         group=settings.INVOICE_CONSUMER_GROUP,
         stream_id=delivery.stream_id,
+        delivery=delivery,
+        replay_prefix=settings.INVOICE_DLQ_REPLAY_PREFIX,
+        workflow_processing_status=result.get("processing_status"),
     )
     logger.info(
         "Acknowledged invoice stream_id=%s attempt=%s queue_age_seconds=%.3f key=%s",

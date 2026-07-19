@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes.extraction import router as extraction_router
 from app.api.routes.gmail import router as gmail_router
 from app.api.routes.notifications import router as notifications_router
+from app.api.routes.queue_operations import router as queue_operations_router
 from app.api.routes.rate_confirmations import router as rate_confirmations_router
 from app.api.routes.shipments import router as shipments_router
 from app.api.routes.workflow import router as workflow_router
@@ -78,6 +79,7 @@ app.add_middleware(
 app.include_router(extraction_router)
 app.include_router(gmail_router)
 app.include_router(notifications_router)
+app.include_router(queue_operations_router)
 app.include_router(rate_confirmations_router)
 app.include_router(shipments_router)
 app.include_router(workflow_router)

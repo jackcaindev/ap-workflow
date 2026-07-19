@@ -8,7 +8,7 @@ import {
   type ReviewDisposition,
 } from "./businessState";
 
-type View = "dashboard" | "shipment_detail" | "runs" | "detail" | "analytics" | "notifications";
+type View = "dashboard" | "shipment_detail" | "runs" | "detail" | "analytics" | "notifications" | "queue";
 
 type RunStatus =
   | "complete"
@@ -122,6 +122,46 @@ type NotificationRecord = {
   rejected_count: number;
   ready_for_posting_count: number;
 };
+
+type ReplayState = "enqueued" | "processing" | "retrying" | "acknowledged" | "dead_lettered";
+
+type DLQEntry = {
+  dlq_id: string;
+  original_stream_id: string | null;
+  failure_reason: string | null;
+  attempt_count: number;
+  failed_at: string | null;
+  filename: string | null;
+  source: {
+    gmail_account: string | null;
+    message_id: string | null;
+    mime_part_id: string | null;
+    idempotency_key: string | null;
+  };
+  replayable: boolean;
+  replay_block_reason: string | null;
+  replay: {
+    count: number;
+    last_request_id: string | null;
+    last_requested_at: string | null;
+    last_enqueued_at: string | null;
+    last_live_stream_id: string | null;
+    state: ReplayState | null;
+    workflow_processing_status: string | null;
+  };
+};
+
+type DLQPage = { items: DLQEntry[]; next_cursor: string | null };
+
+type QueueMetrics = {
+  live_stream_length: number;
+  pending_count: number;
+  oldest_pending_age_seconds: number | null;
+  dlq_count: number;
+  observed_at: string;
+};
+
+type PurgeResult = { before: string; purged_count: number; has_more: boolean };
 
 type ShipmentStatus = "pending" | "partial" | "reconciled" | "exception" | string;
 
@@ -358,6 +398,7 @@ function Sidebar({
     { view: "detail", label: "Run Detail", disabled: !hasSelectedRun },
     { view: "analytics", label: "Carrier Analytics" },
     { view: "notifications", label: "Notifications" },
+    { view: "queue", label: "Queue Operations" },
   ];
 
   return (
@@ -1399,6 +1440,276 @@ function Notifications() {
   );
 }
 
+function formatDuration(seconds: number | null): string {
+  if (seconds === null) return "-";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  return `${(seconds / 3600).toFixed(1)}h`;
+}
+
+function QueueOperations() {
+  const [entries, setEntries] = useState<DLQEntry[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [metrics, setMetrics] = useState<QueueMetrics | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [activeReplay, setActiveReplay] = useState<string | null>(null);
+  const [replayRequests, setReplayRequests] = useState<Record<string, string>>({});
+  const [purgeBefore, setPurgeBefore] = useState("");
+  const [purging, setPurging] = useState(false);
+  const [operationMessage, setOperationMessage] = useState<string | null>(null);
+
+  const loadMetrics = useCallback(async () => {
+    setMetrics(await requestJson<QueueMetrics>("/operations/queue/metrics"));
+  }, []);
+
+  const loadFirstPage = useCallback(async () => {
+    const page = await requestJson<DLQPage>("/operations/queue/dlq?limit=25");
+    setEntries(page.items);
+    setNextCursor(page.next_cursor);
+  }, []);
+
+  const refresh = useCallback(async () => {
+    try {
+      setError(null);
+      await Promise.all([loadFirstPage(), loadMetrics()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load queue operations");
+    } finally {
+      setLoading(false);
+    }
+  }, [loadFirstPage, loadMetrics]);
+
+  useEffect(() => {
+    void refresh();
+    const intervalId = window.setInterval(() => {
+      void loadMetrics().catch(() => undefined);
+    }, 10_000);
+    return () => window.clearInterval(intervalId);
+  }, [loadMetrics, refresh]);
+
+  async function loadOlder() {
+    if (!nextCursor) return;
+    try {
+      setError(null);
+      const page = await requestJson<DLQPage>(
+        `/operations/queue/dlq?limit=25&cursor=${encodeURIComponent(nextCursor)}`,
+      );
+      setEntries((current) => [...current, ...page.items]);
+      setNextCursor(page.next_cursor);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load older DLQ entries");
+    }
+  }
+
+  async function replay(entry: DLQEntry) {
+    const requestId = replayRequests[entry.dlq_id] ?? crypto.randomUUID();
+    setReplayRequests((current) => ({ ...current, [entry.dlq_id]: requestId }));
+    setActiveReplay(entry.dlq_id);
+    setOperationMessage(null);
+    try {
+      const result = await requestJson<{ live_stream_id: string; created: boolean }>(
+        `/operations/queue/dlq/${encodeURIComponent(entry.dlq_id)}/replay`,
+        { method: "POST", headers: { "Idempotency-Key": requestId } },
+      );
+      setReplayRequests((current) => {
+        const next = { ...current };
+        delete next[entry.dlq_id];
+        return next;
+      });
+      setOperationMessage(
+        `${result.created ? "Replay enqueued" : "Existing replay returned"}: ${result.live_stream_id}. Enqueueing does not mean reprocessing succeeded.`,
+      );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Replay request failed");
+    } finally {
+      setActiveReplay(null);
+    }
+  }
+
+  async function purge() {
+    if (!purgeBefore) return;
+    const cutoff = new Date(purgeBefore);
+    if (Number.isNaN(cutoff.getTime())) {
+      setError("Enter a valid purge cutoff");
+      return;
+    }
+    const cutoffIso = cutoff.toISOString();
+    if (!window.confirm(`Permanently purge DLQ entries created before ${cutoffIso}?`)) return;
+    setPurging(true);
+    setOperationMessage(null);
+    try {
+      const result = await requestJson<PurgeResult>("/operations/queue/dlq/purge", {
+        method: "POST",
+        body: JSON.stringify({ before: cutoffIso }),
+      });
+      setOperationMessage(
+        `Purged ${result.purged_count} entr${result.purged_count === 1 ? "y" : "ies"}.${
+          result.has_more ? " More eligible entries remain; submit the same cutoff again." : ""
+        }`,
+      );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Purge request failed");
+    } finally {
+      setPurging(false);
+    }
+  }
+
+  const metricCards = [
+    ["Live stream", metrics?.live_stream_length ?? "-"],
+    ["Pending", metrics?.pending_count ?? "-"],
+    ["Oldest pending", formatDuration(metrics?.oldest_pending_age_seconds ?? null)],
+    ["Dead letters", metrics?.dlq_count ?? "-"],
+  ];
+
+  return (
+    <section>
+      <div className="mb-6 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold text-slate-950">Queue Operations</h1>
+          <p className="mt-1 text-sm text-slate-500">
+            Trusted local-demo controls. Replay and retention are always explicit.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => void refresh()}
+          className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+        >
+          Refresh
+        </button>
+      </div>
+
+      <div className="mb-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        {metricCards.map(([label, value]) => (
+          <div key={label} className="rounded-lg border border-slate-200 bg-white p-4">
+            <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</div>
+            <div className="mt-2 text-2xl font-semibold text-slate-950">{value}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="mb-6 rounded-lg border border-slate-200 bg-slate-50 p-4">
+        <div className="text-sm font-semibold text-slate-900">Age-based retention</div>
+        <div className="mt-3 flex flex-wrap items-end gap-3">
+          <label className="text-sm text-slate-700">
+            Purge entries created before
+            <input
+              type="datetime-local"
+              value={purgeBefore}
+              onChange={(event) => setPurgeBefore(event.target.value)}
+              className="mt-1 block rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+            />
+          </label>
+          <button
+            type="button"
+            disabled={!purgeBefore || purging}
+            onClick={() => void purge()}
+            className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:bg-slate-400"
+          >
+            {purging ? "Purging..." : "Review and purge"}
+          </button>
+        </div>
+      </div>
+
+      {operationMessage ? (
+        <div className="mb-4 rounded-md bg-blue-50 px-3 py-2 text-sm text-blue-800">{operationMessage}</div>
+      ) : null}
+      {error ? <div className="mb-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
+
+      <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
+        <table className="w-full min-w-[1100px] border-collapse text-left text-sm">
+          <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+            <tr>
+              <th className="px-4 py-3 font-semibold">File / source</th>
+              <th className="px-4 py-3 font-semibold">Failure</th>
+              <th className="px-4 py-3 font-semibold">Attempts</th>
+              <th className="px-4 py-3 font-semibold">Failed</th>
+              <th className="px-4 py-3 font-semibold">Stream IDs</th>
+              <th className="px-4 py-3 font-semibold">Replay</th>
+              <th className="px-4 py-3 font-semibold">Action</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {entries.map((entry) => {
+              const retryingAmbiguousRequest = replayRequests[entry.dlq_id] !== undefined;
+              const replayInProgress =
+                entry.replay.state === "enqueued" ||
+                entry.replay.state === "processing" ||
+                entry.replay.state === "retrying";
+              return (
+                <tr key={entry.dlq_id} className="align-top">
+                  <td className="px-4 py-3">
+                    <div className="font-medium text-slate-900">{entry.filename ?? "Unknown file"}</div>
+                    <div className="mt-1 text-xs text-slate-500">
+                      {entry.source.gmail_account ?? "Unknown account"} · message {entry.source.message_id ?? "-"} · part {entry.source.mime_part_id ?? "-"}
+                    </div>
+                  </td>
+                  <td className="max-w-sm px-4 py-3 text-slate-700">
+                    {entry.failure_reason ?? "No reason recorded"}
+                    {!entry.replayable ? (
+                      <div className="mt-1 text-xs font-medium text-red-700">{entry.replay_block_reason}</div>
+                    ) : null}
+                  </td>
+                  <td className="px-4 py-3 text-slate-600">{entry.attempt_count}</td>
+                  <td className="px-4 py-3 text-slate-600">{formatDate(entry.failed_at)}</td>
+                  <td className="px-4 py-3 font-mono text-xs text-slate-600">
+                    <div>DLQ {entry.dlq_id}</div>
+                    <div>Original {entry.original_stream_id ?? "-"}</div>
+                    <div>New {entry.replay.last_live_stream_id ?? "-"}</div>
+                  </td>
+                  <td className="px-4 py-3 text-slate-600">
+                    <div>{entry.replay.state ? <StatusBadge status={entry.replay.state} /> : "Never replayed"}</div>
+                    <div className="mt-1 text-xs">Count: {entry.replay.count}</div>
+                    {entry.replay.workflow_processing_status ? (
+                      <div className="mt-1 text-xs">Workflow: {labelStatus(entry.replay.workflow_processing_status)}</div>
+                    ) : null}
+                  </td>
+                  <td className="px-4 py-3">
+                    <button
+                      type="button"
+                      disabled={
+                        !entry.replayable ||
+                        activeReplay === entry.dlq_id ||
+                        (replayInProgress && !retryingAmbiguousRequest)
+                      }
+                      onClick={() => void replay(entry)}
+                      className="rounded-md bg-slate-900 px-3 py-2 text-xs font-medium text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+                    >
+                      {activeReplay === entry.dlq_id
+                        ? "Requesting..."
+                        : retryingAmbiguousRequest
+                          ? "Retry request"
+                          : "Replay"}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+            {!loading && entries.length === 0 ? (
+              <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-500">No dead-letter entries.</td></tr>
+            ) : null}
+            {loading ? (
+              <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-500">Loading queue state...</td></tr>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
+      {nextCursor ? (
+        <button
+          type="button"
+          onClick={() => void loadOlder()}
+          className="mt-4 rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+        >
+          Load older
+        </button>
+      ) : null}
+    </section>
+  );
+}
+
 export default function App() {
   const [activeView, setActiveView] = useState<View>("dashboard");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
@@ -1455,6 +1766,7 @@ export default function App() {
         ) : null}
         {activeView === "analytics" ? <CarrierAnalytics /> : null}
         {activeView === "notifications" ? <Notifications /> : null}
+        {activeView === "queue" ? <QueueOperations /> : null}
       </main>
     </div>
   );

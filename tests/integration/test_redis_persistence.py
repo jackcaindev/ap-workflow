@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
 from redis.asyncio import Redis
@@ -15,6 +18,7 @@ from app.services.invoice_queue import (
     read_new_batch,
     record_failure,
 )
+from app.services.queue_operations import replay_dlq_entry
 
 
 pytestmark = pytest.mark.integration
@@ -92,6 +96,33 @@ async def test_aof_restart_preserves_pending_retry_and_dlq_state(
         reason="payload is not valid JSON",
     )
 
+    replay_job = make_integration_job("aof-replay")
+    replay_dlq_id = await redis_client.xadd(
+        queue_names.dead_letter_stream,
+        {
+            "original_stream_id": "aof-replay-original-0",
+            "attempt_count": "3",
+            "failed_at": datetime.now(UTC).isoformat(),
+            "failure_reason": "replay after remediation",
+            "original_fields": json.dumps(
+                {"payload": replay_job.model_dump_json()}, sort_keys=True
+            ),
+        },
+    )
+    replay = await replay_dlq_entry(
+        redis_client,
+        dead_letter_stream=queue_names.dead_letter_stream,
+        live_stream=queue_names.stream,
+        replay_prefix=queue_names.replay_prefix,
+        dlq_id=replay_dlq_id,
+        request_id=str(uuid4()),
+    )
+    replay_metadata_key = f"{queue_names.replay_prefix}:{replay_dlq_id}"
+    replay_live_before = await redis_client.xrange(
+        queue_names.stream, replay.live_stream_id, replay.live_stream_id
+    )
+    replay_metadata_before = await redis_client.hgetall(replay_metadata_key)
+
     source_before = await redis_client.xrange(
         queue_names.stream, pending_id, pending_id
     )
@@ -104,7 +135,9 @@ async def test_aof_restart_preserves_pending_retry_and_dlq_state(
     assert pending_before[0]["consumer"] == "retry-owner"
     assert pending_before[0]["times_delivered"] == 2
     assert metadata_before["attempt_count"] == "2"
-    assert len(dlq_before) == 1
+    assert len(dlq_before) == 2
+    assert replay_live_before
+    assert replay_metadata_before["last_live_stream_id"] == replay.live_stream_id
 
     compose_file = os.environ["AP_WORKFLOW_INTEGRATION_COMPOSE_FILE"]
     compose_project = os.environ["AP_WORKFLOW_INTEGRATION_COMPOSE_PROJECT"]
@@ -200,6 +233,10 @@ async def test_aof_restart_preserves_pending_retry_and_dlq_state(
     assert await client.xrange(
         queue_names.dead_letter_stream, "-", "+"
     ) == dlq_before
+    assert await client.xrange(
+        queue_names.stream, replay.live_stream_id, replay.live_stream_id
+    ) == replay_live_before
+    assert await client.hgetall(replay_metadata_key) == replay_metadata_before
 
     reclaimed = await claim_stale_batch(
         client,

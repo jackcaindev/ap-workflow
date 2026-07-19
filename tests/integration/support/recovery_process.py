@@ -86,6 +86,7 @@ def _settings(args: argparse.Namespace) -> SimpleNamespace:
         INVOICE_CONSUMER_GROUP=args.group,
         INVOICE_DEAD_LETTER_STREAM=args.dead_letter_stream,
         INVOICE_METADATA_PREFIX=args.metadata_prefix,
+        INVOICE_DLQ_REPLAY_PREFIX=f"{args.metadata_prefix}:replays",
         INVOICE_MAX_ATTEMPTS=3,
         INVOICE_VISIBILITY_TIMEOUT_MS=100,
     )
