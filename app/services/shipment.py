@@ -1,8 +1,7 @@
-from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -149,21 +148,3 @@ async def upsert_shipment(
     # this function returns.
     await db.flush()
     return shipment
-
-
-async def check_missing_docs_deadline(db: AsyncSession) -> list[Shipment]:
-    cutoff = datetime.now(UTC) - timedelta(days=7)
-    result = await db.execute(
-        select(Shipment)
-        .where(Shipment.created_at < cutoff)
-        .where(
-            or_(
-                Shipment.has_invoice.is_(False),
-                Shipment.has_rate_con.is_(False),
-                Shipment.has_bol.is_(False),
-                Shipment.has_pod.is_(False),
-            )
-        )
-        .order_by(Shipment.created_at.asc())
-    )
-    return list(result.scalars().all())

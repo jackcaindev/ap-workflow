@@ -10,4 +10,4 @@ class ReconciliationCheck(BaseModel):
     check_name: str
     outcome: CheckOutcome
     details: str
-
+    reason_code: str | None = None

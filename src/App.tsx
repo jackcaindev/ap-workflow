@@ -111,7 +111,8 @@ type AuditLogEntry = {
   created_at: string;
 };
 
-type NotificationRecord = {
+type BatchNotificationRecord = {
+  kind: "batch_summary";
   id: number;
   sent_at: string;
   total_count: number;
@@ -122,6 +123,21 @@ type NotificationRecord = {
   rejected_count: number;
   ready_for_posting_count: number;
 };
+
+type ShipmentExceptionNotificationRecord = {
+  kind: "shipment_exception";
+  id: string;
+  sent_at: string | null;
+  occurred_at: string;
+  notification_status: string;
+  transition: "opened" | "changed" | "resolved";
+  shipment_id: string;
+  load_number: string;
+  missing_docs: string[];
+  reason_codes: string[];
+};
+
+type NotificationRecord = BatchNotificationRecord | ShipmentExceptionNotificationRecord;
 
 type ReplayState = "enqueued" | "processing" | "retrying" | "acknowledged" | "dead_lettered";
 
@@ -176,6 +192,10 @@ type ShipmentSummary = {
   has_pod: boolean;
   created_at: string;
   updated_at: string;
+  missing_document_state: "complete" | "within_grace" | "overdue";
+  missing_document_deadline_at: string;
+  missing_required_docs: string[];
+  overdue_reason_codes: string[];
 };
 
 type ReconciliationCheck = {
@@ -183,6 +203,7 @@ type ReconciliationCheck = {
   outcome?: CheckOutcome;
   passed?: boolean;
   details: string;
+  reason_code?: string | null;
 };
 
 type ShipmentDocument = {
@@ -204,10 +225,31 @@ type ShipmentDetailData = ShipmentSummary & {
   reconciliation_result: {
     id: string;
     run_id: string | null;
+    evaluation_source: string;
+    evaluation_key: string | null;
     checks: ReconciliationCheck[];
     missing_docs: string[];
     exception_reasons: string[];
     created_at: string;
+  } | null;
+  missing_document_exception: {
+    id: string;
+    status: "active" | "resolved";
+    missing_docs: string[];
+    reason_codes: string[];
+    deadline_at: string;
+    version: number;
+    opened_at: string;
+    resolved_at: string | null;
+    events: Array<{
+      id: string;
+      version: number;
+      transition: "opened" | "changed" | "resolved";
+      before_state: Record<string, unknown> | null;
+      after_state: Record<string, unknown>;
+      occurred_at: string;
+      notification_status: string;
+    }>;
   } | null;
 };
 
@@ -221,6 +263,8 @@ type CarrierAnalyticsRow = {
   approved_count: number;
   rejected_count: number;
   ready_for_posting_count: number;
+  partial_within_grace_count: number;
+  overdue_missing_documents_count: number;
 };
 
 const API_URL = (import.meta.env.VITE_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
@@ -378,6 +422,16 @@ function StatusBadge({ status }: { status: RunStatus }) {
       {labelStatus(status)}
     </span>
   );
+}
+
+function MissingDocumentBadge({ state }: { state: ShipmentSummary["missing_document_state"] }) {
+  const label = state === "within_grace" ? "Partial — within grace" : state === "overdue" ? "Overdue documents" : "Documents complete";
+  const className = state === "overdue"
+    ? "border-red-200 bg-red-50 text-red-700"
+    : state === "within_grace"
+      ? "border-amber-200 bg-amber-50 text-amber-700"
+      : "border-emerald-200 bg-emerald-50 text-emerald-700";
+  return <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-medium ${className}`}>{label}</span>;
 }
 
 function Sidebar({
@@ -616,7 +670,10 @@ function Dashboard({ onOpenShipment }: { onOpenShipment: (shipmentId: string) =>
                 <td className="px-4 py-3 font-medium text-slate-900">{shipment.load_number}</td>
                 <td className="px-4 py-3 text-slate-600">{shipment.carrier_name ?? "-"}</td>
                 <td className="px-4 py-3">
-                  <StatusBadge status={shipment.reconciliation_status} />
+                  <div className="flex flex-col items-start gap-1">
+                    <StatusBadge status={shipment.reconciliation_status} />
+                    <MissingDocumentBadge state={shipment.missing_document_state} />
+                  </div>
                 </td>
                 <td className="px-4 py-3">
                   <div className="flex flex-wrap gap-2">
@@ -1136,7 +1193,12 @@ function ShipmentDetail({ shipmentId, onBack }: { shipmentId: string; onBack: ()
           <h1 className="text-2xl font-semibold text-slate-950">Shipment Detail</h1>
           <p className="mt-1 text-sm text-slate-500">{detail?.load_number ?? shipmentId}</p>
         </div>
-        {detail ? <StatusBadge status={detail.reconciliation_status} /> : null}
+        {detail ? (
+          <div className="flex flex-wrap gap-2">
+            <StatusBadge status={detail.reconciliation_status} />
+            <MissingDocumentBadge state={detail.missing_document_state} />
+          </div>
+        ) : null}
       </div>
 
       {error ? <div className="mb-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
@@ -1221,6 +1283,30 @@ function ShipmentDetail({ shipmentId, onBack }: { shipmentId: string; onBack: ()
                   : "None"}
               </p>
             </div>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 bg-white p-5">
+            <h2 className="mb-3 text-base font-semibold text-slate-950">Missing-document SLA</h2>
+            <dl className="grid gap-4 md:grid-cols-3">
+              <Field label="State" value={labelStatus(detail.missing_document_state)} />
+              <Field label="Deadline" value={formatDate(detail.missing_document_deadline_at)} />
+              <Field
+                label="Overdue reasons"
+                value={detail.overdue_reason_codes.length > 0 ? detail.overdue_reason_codes.map(labelStatus).join(", ") : "None"}
+              />
+            </dl>
+            {(detail.missing_document_exception?.events ?? []).length > 0 ? (
+              <div className="mt-4 border-t border-slate-100 pt-4">
+                <div className="mb-2 text-xs font-semibold uppercase text-slate-500">Transition history</div>
+                <ul className="space-y-2 text-sm text-slate-700">
+                  {detail.missing_document_exception?.events.map((event) => (
+                    <li key={event.id}>
+                      {formatDate(event.occurred_at)} — {labelStatus(event.transition)} (notification {labelStatus(event.notification_status)})
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
           </div>
 
           <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
@@ -1308,6 +1394,8 @@ function CarrierAnalytics() {
               <th className="px-4 py-3 font-semibold">Carrier</th>
               <th className="px-4 py-3 font-semibold">Shipments</th>
               <th className="px-4 py-3 font-semibold">Exceptions</th>
+              <th className="px-4 py-3 font-semibold">Within Grace</th>
+              <th className="px-4 py-3 font-semibold">Overdue Docs</th>
               <th className="px-4 py-3 font-semibold">Exception Rate</th>
               <th className="px-4 py-3 font-semibold">Pending Review</th>
               <th className="px-4 py-3 font-semibold">Approved</th>
@@ -1322,6 +1410,8 @@ function CarrierAnalytics() {
                 <td className="px-4 py-3 font-medium text-slate-900">{row.carrier_name}</td>
                 <td className="px-4 py-3 text-slate-600">{row.total_shipments}</td>
                 <td className="px-4 py-3 text-slate-600">{row.exception_count}</td>
+                <td className="px-4 py-3 text-slate-600">{row.partial_within_grace_count}</td>
+                <td className="px-4 py-3 text-slate-600">{row.overdue_missing_documents_count}</td>
                 <td className="px-4 py-3 text-slate-600">{formatPercent(row.exception_rate)}</td>
                 <td className="px-4 py-3 text-slate-600">{row.pending_review_count}</td>
                 <td className="px-4 py-3 text-slate-600">{row.approved_count}</td>
@@ -1334,14 +1424,14 @@ function CarrierAnalytics() {
             ))}
             {!loading && rows.length === 0 ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={9}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={11}>
                   No carrier analytics yet.
                 </td>
               </tr>
             ) : null}
             {loading ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={9}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={11}>
                   Loading carrier analytics...
                 </td>
               </tr>
@@ -1380,7 +1470,7 @@ function Notifications() {
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold text-slate-950">Notifications</h1>
-          <p className="mt-1 text-sm text-slate-500">Last 10 batch summary emails sent.</p>
+          <p className="mt-1 text-sm text-slate-500">Last 10 batch and shipment SLA notifications.</p>
         </div>
         <button
           type="button"
@@ -1395,39 +1485,41 @@ function Notifications() {
         <table className="w-full border-collapse text-left text-sm">
           <thead className="bg-slate-50 text-xs uppercase text-slate-500">
             <tr>
-              <th className="px-4 py-3 font-semibold">Sent</th>
-              <th className="px-4 py-3 font-semibold">Processed</th>
-              <th className="px-4 py-3 font-semibold">Complete</th>
-              <th className="px-4 py-3 font-semibold">Needs Review</th>
-              <th className="px-4 py-3 font-semibold">Approved</th>
-              <th className="px-4 py-3 font-semibold">Rejected</th>
-              <th className="px-4 py-3 font-semibold">Ready to Post</th>
-              <th className="px-4 py-3 font-semibold">Failed</th>
+              <th className="px-4 py-3 font-semibold">Occurred</th>
+              <th className="px-4 py-3 font-semibold">Type</th>
+              <th className="px-4 py-3 font-semibold">Details</th>
+              <th className="px-4 py-3 font-semibold">Delivery</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
             {records.map((record) => (
-              <tr key={record.id}>
-                <td className="px-4 py-3 font-medium text-slate-900">{formatDate(record.sent_at)}</td>
-                <td className="px-4 py-3 text-slate-600">{record.total_count}</td>
-                <td className="px-4 py-3 text-slate-600">{record.complete_count}</td>
-                <td className="px-4 py-3 text-slate-600">{record.awaiting_review_count}</td>
-                <td className="px-4 py-3 text-slate-600">{record.approved_count}</td>
-                <td className="px-4 py-3 text-slate-600">{record.rejected_count}</td>
-                <td className="px-4 py-3 text-slate-600">{record.ready_for_posting_count}</td>
-                <td className="px-4 py-3 text-slate-600">{record.failed_count}</td>
+              <tr key={`${record.kind}-${record.id}`}>
+                <td className="px-4 py-3 font-medium text-slate-900">
+                  {formatDate(record.kind === "shipment_exception" ? record.occurred_at : record.sent_at)}
+                </td>
+                <td className="px-4 py-3 text-slate-600">
+                  {record.kind === "shipment_exception" ? "Shipment SLA" : "Batch summary"}
+                </td>
+                <td className="px-4 py-3 text-slate-600">
+                  {record.kind === "shipment_exception"
+                    ? `${record.load_number}: ${labelStatus(record.transition)} — ${record.missing_docs.length > 0 ? record.missing_docs.map(labelStatus).join(", ") : "documents complete"}`
+                    : `${record.total_count} processed, ${record.awaiting_review_count} need review, ${record.ready_for_posting_count} ready to post`}
+                </td>
+                <td className="px-4 py-3 text-slate-600">
+                  {record.kind === "shipment_exception" ? labelStatus(record.notification_status) : "sent"}
+                </td>
               </tr>
             ))}
             {!loading && records.length === 0 ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={8}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={4}>
                   No notification records yet.
                 </td>
               </tr>
             ) : null}
             {loading ? (
               <tr>
-                <td className="px-4 py-8 text-center text-slate-500" colSpan={8}>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={4}>
                   Loading notifications...
                 </td>
               </tr>

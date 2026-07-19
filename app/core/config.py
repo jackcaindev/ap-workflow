@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +28,8 @@ class Settings(BaseSettings):
     # A bounded fan-out limits simultaneous Claude requests, SQLAlchemy
     # sessions, and per-document LangGraph checkpointer connections.
     MAX_BATCH_SIZE: int = 10
+    MISSING_DOCUMENT_SLA_HOURS: int = Field(default=72, gt=0)
+    MISSING_DOCUMENT_SCAN_INTERVAL_SECONDS: int = Field(default=300, gt=0)
 
     model_config = SettingsConfigDict(
         env_file=".env",

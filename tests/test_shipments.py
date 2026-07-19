@@ -18,6 +18,8 @@ async def test_list_shipments(client, db_session, seeded_rate_confirmations):
     assert len(shipments) == 2
     load_numbers = {shipment["load_number"] for shipment in shipments}
     assert load_numbers == {"LD-1001", "LD-2002"}
+    assert all(shipment["missing_document_state"] == "complete" for shipment in shipments)
+    assert all("missing_document_deadline_at" in shipment for shipment in shipments)
 
 
 async def test_shipment_detail_populates_manual_rate_con(
@@ -65,3 +67,5 @@ async def test_carrier_analytics_exposes_business_state_counts(
     assert row["approved_count"] == 0
     assert row["rejected_count"] == 0
     assert row["ready_for_posting_count"] == 0
+    assert row["partial_within_grace_count"] == 0
+    assert row["overdue_missing_documents_count"] == 0

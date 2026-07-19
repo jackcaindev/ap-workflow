@@ -22,6 +22,12 @@ class ReconciliationResult(Base):
             unique=True,
             postgresql_where=text("run_id IS NOT NULL"),
         ),
+        Index(
+            "uq_reconciliation_results_evaluation_key",
+            "evaluation_key",
+            unique=True,
+            postgresql_where=text("evaluation_key IS NOT NULL"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -38,6 +44,10 @@ class ReconciliationResult(Base):
         ForeignKey("workflow_runs.run_id", ondelete="SET NULL"),
         index=True,
     )
+    evaluation_source: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="legacy", server_default="legacy"
+    )
+    evaluation_key: Mapped[str | None] = mapped_column(String(255), index=True)
     checks: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
     missing_docs: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
     exception_reasons: Mapped[list[str]] = mapped_column(JSONB, nullable=False)

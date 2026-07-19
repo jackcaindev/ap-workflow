@@ -79,7 +79,7 @@ export function checkOutcome(check: {
   if (check.passed === false) {
     return "failed";
   }
-  if (check.details.startsWith("skipped:") || check.details.includes("within 3-day grace period")) {
+  if (check.details.startsWith("skipped:")) {
     return "not_evaluated";
   }
   return check.passed === true ? "passed" : "not_evaluated";

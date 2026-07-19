@@ -52,6 +52,7 @@ database.AsyncSessionLocal = async_sessionmaker(
 from fastapi import FastAPI
 
 from app.api.routes.extraction import router as extraction_router
+from app.api.routes.notifications import router as notifications_router
 from app.api.routes.rate_confirmations import router as rate_confirmations_router
 from app.api.routes.queue_operations import router as queue_operations_router
 from app.api.routes.shipments import router as shipments_router
@@ -62,6 +63,7 @@ from app.models.shipment import Shipment
 
 test_app = FastAPI(title="Freight AP Workflow API", version="0.1.0")
 test_app.include_router(extraction_router)
+test_app.include_router(notifications_router)
 test_app.include_router(rate_confirmations_router)
 test_app.include_router(queue_operations_router)
 test_app.include_router(shipments_router)
@@ -72,6 +74,8 @@ SAMPLE_INVOICE_PDF = FIXTURES_DIR / "sample_invoice.pdf"
 
 TRUNCATE_TABLES_SQL = """
 TRUNCATE TABLE
+    shipment_exception_events,
+    shipment_exceptions,
     workflow_audit_logs,
     review_decisions,
     reconciliation_results,

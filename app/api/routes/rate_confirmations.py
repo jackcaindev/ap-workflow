@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -12,6 +12,7 @@ from app.load_numbers import normalize_load_number
 from app.models.document import Document
 from app.models.rate_confirmation import RateConfirmation
 from app.services.shipment import rate_confirmation_extraction, upsert_shipment
+from app.services.reconciliation import reconcile_shipment
 
 
 router = APIRouter(prefix="/rate-confirmations", tags=["rate-confirmations"])
@@ -62,8 +63,17 @@ async def create_rate_confirmation(
         )
         db.add(document)
         await db.flush()
-        await upsert_shipment(rate_confirmation.load_number, document, extraction, db)
-        await db.commit()
+        shipment = await upsert_shipment(
+            rate_confirmation.load_number, document, extraction, db
+        )
+        assert shipment is not None
+        await reconcile_shipment(
+            shipment,
+            db,
+            now=datetime.now(UTC),
+            evaluation_source="manual_rate_confirmation",
+            evaluation_key=f"manual-rate-confirmation:{rate_confirmation.id}",
+        )
     except IntegrityError as exc:
         await db.rollback()
         raise HTTPException(

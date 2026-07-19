@@ -4,21 +4,20 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.models.document import Document
 from app.models.rate_confirmation import RateConfirmation
 from app.models.reconciliation_result import ReconciliationResult
 from app.models.shipment import Shipment
 from app.schemas.reconciliation import CheckOutcome, ReconciliationCheck
+from app.services.missing_document_sla import (
+    evaluate_missing_document_policy,
+    sync_missing_document_exception,
+)
 from app.services.shipment import rate_confirmation_extraction
 
 
 AMOUNT_TOLERANCE = 0.05
-DOC_TYPE_LABELS = {
-    "invoice": "invoice",
-    "rate_confirmation": "rate_con",
-    "bill_of_lading": "bol",
-    "proof_of_delivery": "pod",
-}
 
 
 def _normalize_carrier(value: Any) -> str:
@@ -72,19 +71,6 @@ async def _shipment_documents(
     }
 
 
-def _missing_docs(shipment: Shipment, rate_con: dict[str, Any] | None = None) -> list[str]:
-    missing = []
-    if not shipment.has_invoice:
-        missing.append("invoice")
-    if not shipment.has_rate_con and rate_con is None:
-        missing.append("rate_con")
-    if not shipment.has_bol:
-        missing.append("bol")
-    if not shipment.has_pod:
-        missing.append("pod")
-    return missing
-
-
 def _check(
     checks: list[dict[str, Any]],
     exception_reasons: list[str],
@@ -98,6 +84,7 @@ def _check(
             check_name=check_name,
             outcome=outcome,
             details=details,
+            reason_code=reason if outcome == "failed" else None,
         ).model_dump()
     )
     if outcome == "failed":
@@ -108,7 +95,18 @@ async def reconcile_shipment(
     shipment: Shipment,
     db: AsyncSession,
     run_id: str | None = None,
+    *,
+    now: datetime | None = None,
+    sla_duration: timedelta | None = None,
+    evaluation_source: str | None = None,
+    evaluation_key: str | None = None,
 ) -> ReconciliationResult:
+    now = now or datetime.now(UTC)
+    if sla_duration is None:
+        sla_duration = timedelta(hours=get_settings().MISSING_DOCUMENT_SLA_HOURS)
+    evaluation_source = evaluation_source or (
+        "document_workflow" if run_id is not None else "legacy"
+    )
     documents = await _shipment_documents(shipment, db)
     invoice = _doc_extraction(documents["invoice"])
     rate_con = _doc_extraction(documents["rate_con"])
@@ -191,10 +189,6 @@ async def reconcile_shipment(
             "bol_pickup_date_mismatch",
         )
 
-    shipment_age = datetime.now(UTC) - shipment.created_at
-    # PODs often arrive after invoice/rate paperwork, so a missing POD is only
-    # exceptional after a short grace period. Three days is enough time for the
-    # proof document to surface without blocking early partial reconciliation.
     if shipment.has_pod:
         delivery_date = (pod or {}).get("delivery_date")
         condition = (pod or {}).get("condition")
@@ -206,25 +200,23 @@ async def reconcile_shipment(
             f"delivery_date={delivery_date or 'missing'}, condition={condition or 'missing'}",
             "pod_incomplete",
         )
-    elif shipment_age > timedelta(days=3):
-        _check(
-            checks,
-            exception_reasons,
-            "pod_delivery_confirmation",
-            "failed",
-            "POD missing more than 3 days after shipment creation",
-            "missing_pod",
-        )
     else:
         _check(
             checks,
             exception_reasons,
             "pod_delivery_confirmation",
             "not_evaluated",
-            "POD not received yet, still within 3-day grace period",
+            "POD content cannot be evaluated until the document arrives",
         )
 
-    missing_docs = _missing_docs(shipment, rate_con)
+    policy = evaluate_missing_document_policy(
+        shipment,
+        now=now,
+        sla_duration=sla_duration,
+    )
+    checks.extend(policy.checks)
+    exception_reasons.extend(policy.reason_codes)
+    missing_docs = list(policy.missing_docs)
     _check(
         checks,
         exception_reasons,
@@ -250,10 +242,19 @@ async def reconcile_shipment(
             select(ReconciliationResult).where(ReconciliationResult.run_id == run_id)
         )
         result = existing.scalar_one_or_none()
+    elif evaluation_key is not None:
+        existing = await db.execute(
+            select(ReconciliationResult).where(
+                ReconciliationResult.evaluation_key == evaluation_key
+            )
+        )
+        result = existing.scalar_one_or_none()
     if result is None:
         result = ReconciliationResult(
             shipment_id=shipment.id,
             run_id=run_id,
+            evaluation_source=evaluation_source,
+            evaluation_key=evaluation_key,
             checks=checks,
             missing_docs=missing_docs,
             exception_reasons=exception_reasons,
@@ -261,9 +262,19 @@ async def reconcile_shipment(
         db.add(result)
     else:
         result.shipment_id = shipment.id
+        result.evaluation_source = evaluation_source
+        result.evaluation_key = evaluation_key
         result.checks = checks
         result.missing_docs = missing_docs
         result.exception_reasons = exception_reasons
+    await db.flush()
+    await sync_missing_document_exception(
+        db,
+        shipment,
+        policy,
+        result,
+        now=now,
+    )
     await db.commit()
     await db.refresh(result)
     return result

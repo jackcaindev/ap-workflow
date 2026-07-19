@@ -1,11 +1,20 @@
 import base64
+import logging
+from datetime import UTC, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any
 
+from sqlalchemy import select
+
 from app.database import AsyncSessionLocal
 from app.models.notification import Notification
+from app.models.shipment import Shipment
+from app.models.shipment_exception import ShipmentException, ShipmentExceptionEvent
 from app.services.gmail_auth import get_gmail_service
+
+
+logger = logging.getLogger(__name__)
 
 
 def _format_amount(amount: Any) -> str:
@@ -142,3 +151,97 @@ async def send_batch_summary(results: list[dict]) -> None:
     sent = _send_summary_email(results)
     if sent:
         await _insert_notification_record(results)
+
+
+def _send_shipment_exception_email(payload: dict[str, Any]) -> bool:
+    try:
+        service = get_gmail_service(allow_interactive=False)
+    except RuntimeError as exc:
+        if str(exc) == "No Gmail token found — run /gmail/auth first":
+            return False
+        raise
+
+    profile = service.users().getProfile(userId="me").execute()
+    email_address = profile["emailAddress"]
+    transition = payload["transition"]
+    load_number = payload["load_number"]
+    missing_docs = payload["missing_docs"]
+    message = MIMEMultipart()
+    message["From"] = email_address
+    message["To"] = email_address
+    message["Subject"] = f"AP Workflow — shipment {load_number} SLA exception {transition}"
+    message.attach(
+        MIMEText(
+            "\n".join(
+                [
+                    f"Shipment {load_number}",
+                    f"Missing-document SLA exception: {transition}",
+                    f"Missing required documents: {', '.join(missing_docs) if missing_docs else 'none'}",
+                    f"Reason codes: {', '.join(payload['reason_codes']) if payload['reason_codes'] else 'none'}",
+                ]
+            ),
+            "plain",
+            "utf-8",
+        )
+    )
+    encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+    service.users().messages().send(userId="me", body={"raw": encoded_message}).execute()
+    return True
+
+
+async def dispatch_pending_sla_notifications() -> int:
+    sent_count = 0
+    while True:
+        async with AsyncSessionLocal() as db:
+            row = (
+                await db.execute(
+                    select(ShipmentExceptionEvent, ShipmentException, Shipment)
+                    .join(
+                        ShipmentException,
+                        ShipmentException.id == ShipmentExceptionEvent.exception_id,
+                    )
+                    .join(Shipment, Shipment.id == ShipmentException.shipment_id)
+                    .where(
+                        ShipmentExceptionEvent.notification_status.in_(["pending", "failed"])
+                    )
+                    .order_by(ShipmentExceptionEvent.occurred_at.asc())
+                    .with_for_update(skip_locked=True, of=ShipmentExceptionEvent)
+                    .limit(1)
+                )
+            ).one_or_none()
+            if row is None:
+                return sent_count
+            event, exception, shipment = row
+            payload = {
+                "transition": event.transition,
+                "load_number": shipment.load_number,
+                "missing_docs": event.after_state.get("missing_docs", []),
+                "reason_codes": event.after_state.get("reason_codes", []),
+            }
+            event.notification_status = "sending"
+            event.notification_attempt_count += 1
+            event.notification_last_error = None
+            event_id = event.id
+            await db.commit()
+
+        try:
+            sent = _send_shipment_exception_email(payload)
+            if not sent:
+                raise RuntimeError("Gmail is not authenticated")
+        except Exception as exc:
+            async with AsyncSessionLocal() as db:
+                failed_event = await db.get(ShipmentExceptionEvent, event_id)
+                if failed_event is not None:
+                    failed_event.notification_status = "failed"
+                    failed_event.notification_last_error = str(exc)
+                    await db.commit()
+            logger.warning("Shipment SLA notification delivery failed: %s", exc)
+            return sent_count
+
+        async with AsyncSessionLocal() as db:
+            sent_event = await db.get(ShipmentExceptionEvent, event_id)
+            if sent_event is not None:
+                sent_event.notification_status = "sent"
+                sent_event.notification_sent_at = datetime.now(UTC)
+                await db.commit()
+        sent_count += 1

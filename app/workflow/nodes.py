@@ -9,6 +9,7 @@ from app.models.workflow_audit_log import WorkflowAuditLog
 from app.services.audit import log_audit_event
 from app.services.extraction import extract_document
 from app.services.reconciliation import reconcile_shipment
+from app.services.missing_document_sla import SLA_REASON_CODES
 from app.services.shipment import upsert_shipment
 from app.services.triage import triage_exception
 from app.workflow.state import WorkflowState
@@ -113,17 +114,24 @@ async def match_node(state: WorkflowState) -> dict[str, Any]:
                     db,
                     run_id=state.get("run_id"),
                 )
+                reviewable_reasons = [
+                    reason
+                    for reason in reconciliation.exception_reasons
+                    if reason not in SLA_REASON_CODES
+                ]
                 match_result = {
                     "matched": not reconciliation.exception_reasons,
+                    "requires_review": bool(reviewable_reasons),
                     "shipment_id": str(shipment.id),
                     "reconciliation_result_id": str(reconciliation.id),
                     "reconciliation_status": shipment.reconciliation_status,
                     "checks": reconciliation.checks,
                     "missing_docs": reconciliation.missing_docs,
                     "exception_reasons": reconciliation.exception_reasons,
+                    "reviewable_exception_reasons": reviewable_reasons,
                 }
 
-    if match_result["matched"]:
+    if not match_result.get("requires_review", not match_result["matched"]):
         return {
             "match_result": match_result,
             "exception_reason": None,
@@ -135,10 +143,17 @@ async def match_node(state: WorkflowState) -> dict[str, Any]:
             "iteration_count": _next_iteration(state),
         }
 
-    exception_reasons = match_result.get("exception_reasons") or [match_result.get("reason")]
+    exception_reasons = match_result.get("reviewable_exception_reasons") or [
+        match_result.get("reason")
+    ]
+    reviewable_checks = [
+        check
+        for check in match_result.get("checks") or []
+        if check.get("reason_code") not in SLA_REASON_CODES
+    ]
     exception_reason = _reconciliation_exception_reason(
         [reason for reason in exception_reasons if reason],
-        match_result.get("checks") or [],
+        reviewable_checks,
     )
     return {
         "match_result": match_result,

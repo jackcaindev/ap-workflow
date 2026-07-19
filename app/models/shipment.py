@@ -11,6 +11,7 @@ from app.models.base import Base
 if TYPE_CHECKING:
     from app.models.document import Document
     from app.models.reconciliation_result import ReconciliationResult
+    from app.models.shipment_exception import ShipmentException
 
 
 class Shipment(Base):
@@ -79,6 +80,11 @@ class Shipment(Base):
     )
     reconciliation_results: Mapped[list["ReconciliationResult"]] = relationship(
         "ReconciliationResult",
+        back_populates="shipment",
+        cascade="all, delete-orphan",
+    )
+    exceptions: Mapped[list["ShipmentException"]] = relationship(
+        "ShipmentException",
         back_populates="shipment",
         cascade="all, delete-orphan",
     )

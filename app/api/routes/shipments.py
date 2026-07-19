@@ -1,4 +1,5 @@
 from collections import Counter, defaultdict
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -11,7 +12,10 @@ from app.models.rate_confirmation import RateConfirmation
 from app.models.reconciliation_result import ReconciliationResult
 from app.models.review_decision import ReviewDecision
 from app.models.shipment import Shipment
+from app.models.shipment_exception import ShipmentException, ShipmentExceptionEvent
 from app.models.workflow_run import WorkflowRun
+from app.core.config import get_settings
+from app.services.missing_document_sla import evaluate_missing_document_policy
 
 
 router = APIRouter(tags=["shipments"])
@@ -25,7 +29,13 @@ DOC_ID_FIELDS = {
 }
 
 
-def _shipment_summary(shipment: Shipment) -> dict:
+def _shipment_summary(shipment: Shipment, *, now: datetime | None = None) -> dict:
+    now = now or datetime.now(UTC)
+    policy = evaluate_missing_document_policy(
+        shipment,
+        now=now,
+        sla_duration=timedelta(hours=get_settings().MISSING_DOCUMENT_SLA_HOURS),
+    )
     return {
         "id": str(shipment.id),
         "load_number": shipment.load_number,
@@ -37,6 +47,10 @@ def _shipment_summary(shipment: Shipment) -> dict:
         "has_pod": shipment.has_pod,
         "created_at": shipment.created_at,
         "updated_at": shipment.updated_at,
+        "missing_document_state": policy.state,
+        "missing_document_deadline_at": policy.deadline_at,
+        "missing_required_docs": list(policy.missing_docs),
+        "overdue_reason_codes": list(policy.reason_codes),
     }
 
 
@@ -47,7 +61,7 @@ async def _latest_reconciliation_result(
     result = await db.execute(
         select(ReconciliationResult)
         .where(ReconciliationResult.shipment_id == shipment_id)
-        .order_by(ReconciliationResult.created_at.desc())
+        .order_by(ReconciliationResult.created_at.desc(), ReconciliationResult.id.desc())
         .limit(1)
     )
     return result.scalar_one_or_none()
@@ -106,7 +120,8 @@ async def list_shipments(
         query = query.where(Shipment.reconciliation_status == status_filter)
 
     result = await db.execute(query)
-    return [_shipment_summary(shipment) for shipment in result.scalars()]
+    now = datetime.now(UTC)
+    return [_shipment_summary(shipment, now=now) for shipment in result.scalars()]
 
 
 @router.get("/shipments/{shipment_id}")
@@ -122,16 +137,57 @@ async def shipment_detail(
         )
 
     reconciliation = await _latest_reconciliation_result(shipment.id, db)
+    current_exception = await db.scalar(
+        select(ShipmentException).where(
+            ShipmentException.shipment_id == shipment.id,
+            ShipmentException.kind == "missing_required_documents",
+        )
+    )
+    events = []
+    if current_exception is not None:
+        events = list(
+            (
+                await db.scalars(
+                    select(ShipmentExceptionEvent)
+                    .where(ShipmentExceptionEvent.exception_id == current_exception.id)
+                    .order_by(ShipmentExceptionEvent.version.asc())
+                )
+            ).all()
+        )
     return {
         **_shipment_summary(shipment),
         "documents": await _document_payloads(shipment, db),
         "reconciliation_result": None if reconciliation is None else {
             "id": str(reconciliation.id),
             "run_id": reconciliation.run_id,
+            "evaluation_source": reconciliation.evaluation_source,
+            "evaluation_key": reconciliation.evaluation_key,
             "checks": reconciliation.checks,
             "missing_docs": reconciliation.missing_docs,
             "exception_reasons": reconciliation.exception_reasons,
             "created_at": reconciliation.created_at,
+        },
+        "missing_document_exception": None if current_exception is None else {
+            "id": str(current_exception.id),
+            "status": current_exception.status,
+            "missing_docs": current_exception.missing_docs,
+            "reason_codes": current_exception.reason_codes,
+            "deadline_at": current_exception.deadline_at,
+            "version": current_exception.version,
+            "opened_at": current_exception.opened_at,
+            "resolved_at": current_exception.resolved_at,
+            "events": [
+                {
+                    "id": str(event.id),
+                    "version": event.version,
+                    "transition": event.transition,
+                    "before_state": event.before_state,
+                    "after_state": event.after_state,
+                    "occurred_at": event.occurred_at,
+                    "notification_status": event.notification_status,
+                }
+                for event in events
+            ],
         },
     }
 
@@ -142,7 +198,9 @@ async def carrier_analytics(db: AsyncSession = Depends(get_session)) -> list[dic
     shipments = list(shipments_result.scalars().all())
 
     reconciliation_result = await db.execute(
-        select(ReconciliationResult).order_by(ReconciliationResult.created_at.desc())
+        select(ReconciliationResult).order_by(
+            ReconciliationResult.created_at.desc(), ReconciliationResult.id.desc()
+        )
     )
     latest_by_shipment: dict[UUID, ReconciliationResult] = {}
     for result in reconciliation_result.scalars():
@@ -167,6 +225,8 @@ async def carrier_analytics(db: AsyncSession = Depends(get_session)) -> list[dic
         grouped[shipment.carrier_name or "Unknown carrier"].append(shipment)
 
     rows = []
+    now = datetime.now(UTC)
+    sla_duration = timedelta(hours=get_settings().MISSING_DOCUMENT_SLA_HOURS)
     for carrier_name, carrier_shipments in grouped.items():
         total_shipments = len(carrier_shipments)
         exception_shipments = [
@@ -185,7 +245,16 @@ async def carrier_analytics(db: AsyncSession = Depends(get_session)) -> list[dic
         approved_count = 0
         rejected_count = 0
         ready_for_posting_count = 0
+        partial_within_grace_count = 0
+        overdue_missing_documents_count = 0
         for shipment in carrier_shipments:
+            missing_state = evaluate_missing_document_policy(
+                shipment, now=now, sla_duration=sla_duration
+            ).state
+            if missing_state == "within_grace":
+                partial_within_grace_count += 1
+            elif missing_state == "overdue":
+                overdue_missing_documents_count += 1
             latest = latest_by_shipment.get(shipment.id)
             if latest is None or latest.run_id is None:
                 continue
@@ -214,6 +283,8 @@ async def carrier_analytics(db: AsyncSession = Depends(get_session)) -> list[dic
                 "approved_count": approved_count,
                 "rejected_count": rejected_count,
                 "ready_for_posting_count": ready_for_posting_count,
+                "partial_within_grace_count": partial_within_grace_count,
+                "overdue_missing_documents_count": overdue_missing_documents_count,
             }
         )
 

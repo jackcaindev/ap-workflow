@@ -37,7 +37,7 @@ async def test_reconcile_shipment_missing_pod_exception(db_session, seeded_rate_
     result = await reconcile_shipment(shipment, db_session)
 
     assert shipment.reconciliation_status == "exception"
-    assert "missing_pod" in result.exception_reasons
+    assert "missing_required_pod_sla_exceeded" in result.exception_reasons
 
 
 async def test_reconcile_shipment_partial_docs(db_session, seeded_rate_confirmations):
