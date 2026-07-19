@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from app.schemas.extraction import InvoiceExtraction
 
 from tests.conftest import SAMPLE_INVOICE_EXTRACTION
@@ -26,3 +29,18 @@ async def test_extract_invoice_pdf_returns_invoice_extraction_schema(
     assert extraction.total_amount == SAMPLE_INVOICE_EXTRACTION["total_amount"]
     assert len(extraction.line_items) == len(SAMPLE_INVOICE_EXTRACTION["line_items"])
     assert 0 <= extraction.confidence <= 1
+
+
+def test_load_number_is_normalized_for_shipment_identity():
+    extraction = InvoiceExtraction.model_validate(
+        {**SAMPLE_INVOICE_EXTRACTION, "load_number": "  ld-1001  "}
+    )
+
+    assert extraction.load_number == "LD-1001"
+
+
+def test_empty_load_number_is_rejected():
+    with pytest.raises(ValidationError, match="load_number cannot be empty"):
+        InvoiceExtraction.model_validate(
+            {**SAMPLE_INVOICE_EXTRACTION, "load_number": "   "}
+        )

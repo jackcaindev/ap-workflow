@@ -2,6 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.load_numbers import normalize_load_number
+
 
 DocumentType = Literal[
     "invoice",
@@ -27,6 +29,11 @@ class InvoiceExtraction(BaseModel):
     line_items: list[LineItem]
     doc_type: Literal["invoice", "rate_confirmation"]
     confidence: float = Field(ge=0, le=1)
+
+    @field_validator("load_number")
+    @classmethod
+    def normalize_load_number_value(cls, value: str | None) -> str | None:
+        return normalize_load_number(value)
 
     @field_validator("total_amount")
     @classmethod
@@ -55,6 +62,11 @@ class BOLExtraction(BaseModel):
     weight_lbs: float | None
     doc_type: Literal["bill_of_lading"]
 
+    @field_validator("load_number")
+    @classmethod
+    def normalize_load_number_value(cls, value: str | None) -> str | None:
+        return normalize_load_number(value)
+
     @field_validator("carrier_name")
     @classmethod
     def normalize_carrier_name(cls, value: str) -> str:
@@ -71,6 +83,11 @@ class PODExtraction(BaseModel):
     condition: str
     receiver_name: str | None
     doc_type: Literal["proof_of_delivery"]
+
+    @field_validator("load_number")
+    @classmethod
+    def normalize_load_number_value(cls, value: str | None) -> str | None:
+        return normalize_load_number(value)
 
     @field_validator("carrier_name")
     @classmethod

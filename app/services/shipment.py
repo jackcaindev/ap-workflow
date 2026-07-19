@@ -1,9 +1,12 @@
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import or_, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.load_numbers import normalize_load_number
 from app.models.document import Document
 from app.models.rate_confirmation import RateConfirmation
 from app.models.shipment import Shipment
@@ -101,21 +104,33 @@ async def upsert_shipment(
     extraction: dict[str, Any],
     db: AsyncSession,
 ) -> Shipment | None:
-    if not load_number:
+    normalized_load_number = normalize_load_number(load_number)
+    if normalized_load_number is None:
         return None
 
-    result = await db.execute(select(Shipment).where(Shipment.load_number == load_number))
-    shipment = result.scalar_one_or_none()
-    if shipment is None:
-        shipment = Shipment(load_number=load_number, reconciliation_status="pending")
-        db.add(shipment)
-        await db.flush()
+    await db.execute(
+        insert(Shipment)
+        .values(
+            id=uuid4(),
+            load_number=normalized_load_number,
+            reconciliation_status="pending",
+        )
+        .on_conflict_do_nothing(index_elements=[Shipment.load_number])
+    )
+    result = await db.execute(
+        select(Shipment)
+        .where(Shipment.load_number == normalized_load_number)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    shipment = result.scalar_one()
 
     document.shipment_id = shipment.id
     doc_fields = DOC_FIELDS.get(document.doc_type)
     if doc_fields is not None:
         doc_id_field, present_field = doc_fields
-        setattr(shipment, doc_id_field, document.id)
+        if getattr(shipment, doc_id_field) is None:
+            setattr(shipment, doc_id_field, document.id)
         setattr(shipment, present_field, True)
 
     if not shipment.carrier_name and extraction.get("carrier_name"):
@@ -129,8 +144,10 @@ async def upsert_shipment(
     elif present_count < len(DOC_FIELDS):
         shipment.reconciliation_status = "partial"
 
-    await db.commit()
-    await db.refresh(shipment)
+    # The caller owns the transaction. Workflow assembly keeps this row lock
+    # through reconciliation; manual rate-confirmation creation commits after
+    # this function returns.
+    await db.flush()
     return shipment
 
 

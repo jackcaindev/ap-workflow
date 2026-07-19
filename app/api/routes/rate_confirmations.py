@@ -2,12 +2,13 @@ from datetime import date, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
+from app.load_numbers import normalize_load_number
 from app.models.document import Document
 from app.models.rate_confirmation import RateConfirmation
 from app.services.shipment import rate_confirmation_extraction, upsert_shipment
@@ -24,6 +25,13 @@ class RateConfirmationCreate(BaseModel):
     agreed_rate: float = Field(ge=0)
     currency: str = "USD"
     shipment_date: date
+
+    @field_validator("load_number")
+    @classmethod
+    def normalize_load_number_value(cls, value: str) -> str:
+        normalized = normalize_load_number(value)
+        assert normalized is not None
+        return normalized
 
 
 class RateConfirmationRead(RateConfirmationCreate):
@@ -55,6 +63,7 @@ async def create_rate_confirmation(
         db.add(document)
         await db.flush()
         await upsert_shipment(rate_confirmation.load_number, document, extraction, db)
+        await db.commit()
     except IntegrityError as exc:
         await db.rollback()
         raise HTTPException(
