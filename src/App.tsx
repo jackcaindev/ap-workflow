@@ -75,7 +75,9 @@ type ExtractionData = Record<string, unknown> & {
 };
 
 type MatchResult = {
-  matched: boolean;
+  // Older and current APIs may include this legacy projection. Presentation
+  // uses the explicit business-state dimensions instead.
+  matched?: boolean;
   reason?: string;
   agreed_rate?: number;
   invoiced_amount?: number;
@@ -422,6 +424,41 @@ function StatusBadge({ status }: { status: RunStatus }) {
       {labelStatus(status)}
     </span>
   );
+}
+
+function reconciliationSummary(detail: RunDetailData): { label: string; badgeStatus: RunStatus } {
+  const reconciliation = detail.reconciliation_status;
+  const review = detail.review_disposition;
+  const posting = detail.posting_status;
+
+  if (reconciliation === "exception" && review === "approved") {
+    return {
+      label: `exception · approved override · ${labelStatus(posting)}`,
+      badgeStatus: "approved",
+    };
+  }
+  if (reconciliation === "exception" && review === "rejected") {
+    return {
+      label: `exception · rejected · ${labelStatus(posting)}`,
+      badgeStatus: "rejected",
+    };
+  }
+  if (reconciliation === "exception" && review === "pending") {
+    return { label: "exception · awaiting review", badgeStatus: "exception" };
+  }
+  if (reconciliation === "reconciled") {
+    return {
+      label: `reconciled · ${labelStatus(posting)}`,
+      badgeStatus: "reconciled",
+    };
+  }
+  if (reconciliation) {
+    return { label: labelStatus(reconciliation), badgeStatus: reconciliation };
+  }
+  return {
+    label: detail.processing_status === "failed" ? "not evaluated · processing failed" : "not evaluated",
+    badgeStatus: detail.processing_status,
+  };
 }
 
 function MissingDocumentBadge({ state }: { state: ShipmentSummary["missing_document_state"] }) {
@@ -989,6 +1026,7 @@ function RunDetail({
   const docType = typeof extraction?.doc_type === "string" ? extraction.doc_type : "unknown";
   const isInvoice = docType === "invoice";
   const match = isInvoice ? detail?.match_result : null;
+  const reconciliationDisplay = detail ? reconciliationSummary(detail) : null;
   const lineItems = isInvoice && Array.isArray(extraction?.line_items) ? extraction.line_items : [];
   const loadNumber =
     typeof extraction?.load_number === "string" && extraction.load_number.trim() !== ""
@@ -1079,17 +1117,12 @@ function RunDetail({
           {isInvoice ? (
             <div className="rounded-lg border border-slate-200 bg-white p-5">
               <div className="mb-4 flex items-center justify-between gap-3">
-                <h2 className="text-base font-semibold text-slate-950">Match Result</h2>
-                {match ? (
-                  <span
-                    className={`rounded-full border px-2.5 py-1 text-xs font-medium ${
-                      match.matched
-                        ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                        : "border-amber-200 bg-amber-50 text-amber-700"
-                    }`}
-                  >
-                    {match.matched ? "matched" : "unmatched"}
-                  </span>
+                <h2 className="text-base font-semibold text-slate-950">Reconciliation Result</h2>
+                {reconciliationDisplay ? (
+                  <div className="flex items-center gap-2">
+                    <StatusBadge status={reconciliationDisplay.badgeStatus} />
+                    <span className="text-xs text-slate-500">{reconciliationDisplay.label}</span>
+                  </div>
                 ) : null}
               </div>
               <dl className="grid gap-4 md:grid-cols-3">

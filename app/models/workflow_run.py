@@ -21,6 +21,9 @@ class WorkflowRun(Base):
         nullable=False,
         index=True,
     )
+    # Persisted compatibility projection for existing rows, checkpoints, and
+    # API clients. Current business logic uses the dimensions below plus the
+    # immutable ReviewDecision relationship.
     status: Mapped[str] = mapped_column(nullable=False, default="pending")
     processing_status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="pending", server_default="pending"

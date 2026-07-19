@@ -119,6 +119,12 @@ async def test_workflow_happy_path_without_review_is_ready_for_posting(
     assert payload["review_disposition"] == "not_required"
     assert payload["posting_status"] == "ready_for_posting"
 
+    detail = await client.get(f"/workflow/{payload['run_id']}")
+    assert detail.status_code == 200
+    # Retained only as a public compatibility projection; business behavior is
+    # asserted through the independent dimensions above.
+    assert detail.json()["match_result"]["matched"] is True
+
 
 async def test_rejected_review_is_durable(
     client, sample_invoice_pdf, mock_claude, seeded_rate_confirmations

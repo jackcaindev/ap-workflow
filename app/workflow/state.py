@@ -14,6 +14,8 @@ class WorkflowState(TypedDict):
     triage_reasoning: str | None
     triage_confidence: float | None
     human_decision: str | None
+    # Retained for existing checkpoints and API compatibility. Nodes make
+    # current decisions from the explicit state dimensions below.
     status: str
     processing_status: NotRequired[str]
     posting_status: NotRequired[str]

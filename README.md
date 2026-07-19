@@ -16,11 +16,13 @@ Gmail Poller ──XADD──▶ Redis Stream (freight-ap:invoice-jobs:v1)
                               │
                               ▼
                         Invoice Worker
+                  (independent deliveries)
                               │
                     ┌─────────┴─────────┐
                     ▼                   ▼
               LangGraph Workflow    Batch Email
-           (extract → match → HITL)   Notifier
+          (extract → assemble shipment  Notifier
+          → reconcile → optional HITL)
                     │
                     ▼
               PostgreSQL
@@ -177,7 +179,6 @@ app/
 │   ├── gmail_poller.py      # Inbox polling and Redis Streams enqueue
 │   ├── invoice_queue.py     # Stream/group, ACK, recovery, and DLQ operations
 │   ├── invoice_worker.py    # Consumer-group delivery and LangGraph invocation
-│   ├── matching.py          # Invoice-to-rate-confirmation amount matching
 │   ├── notifier.py          # Batch summary email via Gmail
 │   ├── reconciliation.py    # Full shipment reconciliation checks
 │   └── shipment.py          # Shipment upsert and document linking
@@ -207,6 +208,8 @@ Reads are bounded by `MAX_BATCH_SIZE`, but each entry is processed, acknowledged
 **Partial reconciliation on incomplete document sets.** Freight paperwork arrives asynchronously — an invoice may show up days before the BOL or POD. Rather than waiting for all four documents, reconciliation runs on whatever is present. Invoice, rate confirmation, BOL, and POD presence share the configurable `MISSING_DOCUMENT_SLA_HOURS` grace period (72 hours by default). Missing evidence is `not_evaluated` while within grace and becomes an explicit shipment-level overdue exception after the SLA. `MISSING_DOCUMENT_SCAN_INTERVAL_SECONDS` controls the best-effort in-process scanner cadence.
 
 **Business state is multidimensional.** Workflow processing (`pending` through `complete` or `failed`), shipment reconciliation (`pending`, `partial`, `reconciled`, or `exception`), immutable human disposition (`approved` or `rejected`), and downstream posting/payment state are persisted separately. An approved exception remains an exceptional reconciliation with an explicit business override; it becomes `ready_for_posting` without pretending the shipment reconciled. Rejected work is `blocked`. The legacy run `status` remains a compatibility projection, so `complete_node` can no longer erase an approval or rejection.
+
+Workflow checkpoint state and the workflow-detail API also retain `match_result.matched` as a legacy serialization projection for existing checkpoints and clients. Current routing and UI presentation do not use that boolean: they use explicit reconciliation, review-disposition, and posting dimensions. The React adapters continue to accept older status-only responses and historical reconciliation checks that used `passed` instead of `outcome`.
 
 Reconciliation checks use `passed`, `failed`, or `not_evaluated`. Missing prerequisites and grace-period checks are never reported as successful. Review decisions are serialized with a PostgreSQL row lock, persisted once, and safely replayed from the LangGraph checkpoint after a narrow checkpoint/database crash window. This does not change the Redis Streams at-least-once boundary, deterministic job identity, ACK timing, retries, or DLQ behavior described above.
 

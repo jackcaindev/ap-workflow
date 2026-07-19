@@ -98,12 +98,17 @@ async def match_node(state: WorkflowState) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
         document = await db.get(Document, int(state["document_id"]))
         if document is None:
-            match_result = {"matched": False, "reason": "document_not_found"}
+            match_result = {
+                "matched": False,
+                "requires_review": True,
+                "reason": "document_not_found",
+            }
         else:
             shipment = await upsert_shipment(extraction.get("load_number"), document, extraction, db)
             if shipment is None:
                 match_result = {
                     "matched": False,
+                    "requires_review": True,
                     "reason": "no_load_number",
                     "missing_docs": [],
                     "exception_reasons": ["no_load_number"],
@@ -120,6 +125,9 @@ async def match_node(state: WorkflowState) -> dict[str, Any]:
                     if reason not in SLA_REASON_CODES
                 ]
                 match_result = {
+                    # Retained in checkpoint and API payloads as a legacy
+                    # projection. Current routing uses requires_review and the
+                    # independent business-state dimensions instead.
                     "matched": not reconciliation.exception_reasons,
                     "requires_review": bool(reviewable_reasons),
                     "shipment_id": str(shipment.id),
@@ -131,7 +139,7 @@ async def match_node(state: WorkflowState) -> dict[str, Any]:
                     "reviewable_exception_reasons": reviewable_reasons,
                 }
 
-    if not match_result.get("requires_review", not match_result["matched"]):
+    if not match_result["requires_review"]:
         return {
             "match_result": match_result,
             "exception_reason": None,

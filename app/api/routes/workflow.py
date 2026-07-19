@@ -285,6 +285,8 @@ async def workflow_detail(run_id: str, db: AsyncSession = Depends(get_session)) 
     reconciliation = reconciliation_result.scalar_one_or_none()
     decision = await get_review_decision(db, run.run_id)
     match_result = None if reconciliation is None else {
+        # Public compatibility projection for older clients. Authoritative
+        # decisions use reconciliation, review, and posting state dimensions.
         "matched": not reconciliation.exception_reasons,
         "reconciliation_result_id": str(reconciliation.id),
         "shipment_id": str(reconciliation.shipment_id),
