@@ -12,6 +12,7 @@ from app.models.notification import Notification
 from app.models.shipment import Shipment
 from app.models.shipment_exception import ShipmentException, ShipmentExceptionEvent
 from app.services.gmail_auth import get_gmail_service
+from app.services.health import RuntimeHealth, reason_code_for_exception, utc_now
 
 
 logger = logging.getLogger(__name__)
@@ -189,7 +190,9 @@ def _send_shipment_exception_email(payload: dict[str, Any]) -> bool:
     return True
 
 
-async def dispatch_pending_sla_notifications() -> int:
+async def dispatch_pending_sla_notifications(
+    runtime_health: RuntimeHealth | None = None,
+) -> int:
     sent_count = 0
     while True:
         async with AsyncSessionLocal() as db:
@@ -229,6 +232,10 @@ async def dispatch_pending_sla_notifications() -> int:
             if not sent:
                 raise RuntimeError("Gmail is not authenticated")
         except Exception as exc:
+            if runtime_health is not None:
+                runtime_health.notifications.failed(
+                    utc_now(), reason_code_for_exception(exc)
+                )
             async with AsyncSessionLocal() as db:
                 failed_event = await db.get(ShipmentExceptionEvent, event_id)
                 if failed_event is not None:

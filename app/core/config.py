@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     MAX_BATCH_SIZE: int = 10
     MISSING_DOCUMENT_SLA_HOURS: int = Field(default=72, gt=0)
     MISSING_DOCUMENT_SCAN_INTERVAL_SECONDS: int = Field(default=300, gt=0)
+    HEALTH_PROBE_TIMEOUT_SECONDS: float = Field(default=1.0, gt=0)
+    GMAIL_POLL_INTERVAL_SECONDS: int = Field(default=300, gt=0)
+    HEALTH_STALE_AFTER_MULTIPLIER: float = Field(default=2.5, gt=1)
 
     model_config = SettingsConfigDict(
         env_file=".env",

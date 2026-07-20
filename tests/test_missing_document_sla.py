@@ -200,13 +200,14 @@ async def test_scanner_failure_is_visible_and_next_iteration_recovers(monkeypatc
     assert not await run_scanner_iteration(
         health, now=NOW, sla_duration=SLA, scan=flaky_scan
     )
-    assert health.last_error == "database unavailable"
+    assert health.last_error == "scan_failed"
     assert health.consecutive_failures == 1
     assert await run_scanner_iteration(
         health, now=NOW + timedelta(minutes=5), sla_duration=SLA, scan=flaky_scan
     )
     assert health.last_error is None
     assert health.consecutive_failures == 0
+    assert health.last_result_count == 0
     assert logged == ["Scheduled missing-document SLA scan failed"]
 
 

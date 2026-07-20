@@ -39,6 +39,7 @@ class ScannerHealth:
     last_succeeded_at: datetime | None = None
     last_error: str | None = None
     consecutive_failures: int = 0
+    last_result_count: int | None = None
 
     def payload(self) -> dict:
         status = "degraded" if self.last_error else "ok"
@@ -270,13 +271,14 @@ async def run_scanner_iteration(
 ) -> bool:
     health.last_started_at = now
     try:
-        await scan(now=now, sla_duration=sla_duration)
-    except Exception as exc:
-        health.last_error = str(exc)
+        count = await scan(now=now, sla_duration=sla_duration)
+    except Exception:
+        health.last_error = "scan_failed"
         health.consecutive_failures += 1
         logger.exception("Scheduled missing-document SLA scan failed")
         return False
     health.last_succeeded_at = now
     health.last_error = None
     health.consecutive_failures = 0
+    health.last_result_count = count
     return True

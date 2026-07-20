@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from app.core.config import get_settings
 from app.services.gmail_poller import poll_inbox
@@ -22,6 +22,8 @@ async def gmail_auth() -> dict[str, str]:
 
 
 @router.post("/poll")
-async def gmail_poll() -> dict[str, int]:
-    processed_count = await poll_inbox()
+async def gmail_poll(request: Request) -> dict[str, int]:
+    processed_count = await poll_inbox(
+        getattr(request.app.state, "runtime_health", None)
+    )
     return {"count": processed_count}

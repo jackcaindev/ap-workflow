@@ -11,6 +11,7 @@ from redis.asyncio import Redis
 from app.core.config import get_settings
 from app.schemas.invoice_job import InvoiceJobEnvelope
 from app.services.gmail_auth import get_gmail_service
+from app.services.health import RuntimeHealth, reason_code_for_exception, utc_now
 from app.services.invoice_queue import enqueue_job
 
 
@@ -127,8 +128,10 @@ def _mark_message_read(service: Any, message_id: str) -> None:
     ).execute()
 
 
-async def poll_inbox() -> int:
+async def poll_inbox(runtime_health: RuntimeHealth | None = None) -> int:
     settings = get_settings()
+    if runtime_health is not None:
+        runtime_health.gmail.started(utc_now())
     redis = Redis.from_url(settings.REDIS_URL, decode_responses=True)
     processed_messages = 0
 
@@ -181,6 +184,14 @@ async def poll_inbox() -> int:
             processed_messages += 1
 
         logger.info("Gmail poll processed %s message(s)", processed_messages)
+        if runtime_health is not None:
+            runtime_health.gmail.succeeded(utc_now(), processed_messages)
         return processed_messages
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if runtime_health is not None:
+            runtime_health.gmail.failed(utc_now(), reason_code_for_exception(exc))
+        raise
     finally:
         await redis.aclose()

@@ -28,6 +28,7 @@ from app.services.invoice_queue import (
     record_failure,
     record_replay_processing,
 )
+from app.services.health import RuntimeHealth, reason_code_for_exception, utc_now
 from app.services.notifier import send_batch_summary
 from app.workflow.graph import workflow_graph
 
@@ -465,17 +466,28 @@ async def _process_batch(
     return summaries
 
 
-async def _flush_batch_summary(results: list[dict]) -> list[dict]:
+async def _flush_batch_summary(
+    results: list[dict], runtime_health: RuntimeHealth | None = None
+) -> list[dict]:
     if not results:
         return results
+    if runtime_health is not None:
+        runtime_health.notifications.started(utc_now())
     try:
         await send_batch_summary(results)
-    except Exception:
+    except Exception as exc:
+        if runtime_health is not None:
+            runtime_health.notifications.failed(
+                utc_now(), reason_code_for_exception(exc)
+            )
         logger.exception("Failed to send invoice batch summary")
+    else:
+        if runtime_health is not None:
+            runtime_health.notifications.succeeded(utc_now(), 1)
     return []
 
 
-async def process_invoice_queue() -> None:
+async def process_invoice_queue(runtime_health: RuntimeHealth | None = None) -> None:
     settings = get_settings()
     consumer = f"{socket.gethostname()}:{os.getpid()}:{uuid4()}"
     redis = Redis.from_url(
@@ -491,6 +503,8 @@ async def process_invoice_queue() -> None:
             stream=settings.INVOICE_STREAM,
             group=settings.INVOICE_CONSUMER_GROUP,
         )
+        if runtime_health is not None:
+            runtime_health.worker_started()
         logger.info("Invoice stream worker started as %s", consumer)
         while True:
             try:
@@ -512,16 +526,24 @@ async def process_invoice_queue() -> None:
                         block_ms=settings.INVOICE_READ_BLOCK_MS,
                     )
                 if not deliveries:
-                    batch_results = await _flush_batch_summary(batch_results)
+                    batch_results = await _flush_batch_summary(
+                        batch_results, runtime_health
+                    )
                     continue
                 batch_results.extend(
                     await _process_batch(redis, deliveries, settings, consumer)
                 )
             except RedisTimeoutError:
-                batch_results = await _flush_batch_summary(batch_results)
+                batch_results = await _flush_batch_summary(batch_results, runtime_health)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Invoice stream batch failed")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if runtime_health is not None:
+            runtime_health.worker_failed(reason_code_for_exception(exc))
+        raise
     finally:
         await redis.aclose()

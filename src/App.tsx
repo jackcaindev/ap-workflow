@@ -7,6 +7,12 @@ import {
   type ProcessingStatus,
   type ReviewDisposition,
 } from "./businessState";
+import {
+  healthDotClass,
+  healthLabel,
+  safeReasonLabel,
+  type ReadinessResponse,
+} from "./health";
 
 type View = "dashboard" | "shipment_detail" | "runs" | "detail" | "analytics" | "notifications" | "queue";
 
@@ -482,6 +488,7 @@ function Sidebar({
   hasSelectedShipment: boolean;
   onSelect: (view: View) => void;
 }) {
+  const [readiness, setReadiness] = useState<ReadinessResponse | null>(null);
   const items: { view: View; label: string; disabled?: boolean }[] = [
     { view: "dashboard", label: "Dashboard" },
     { view: "shipment_detail", label: "Shipment Detail", disabled: !hasSelectedShipment },
@@ -491,6 +498,25 @@ function Sidebar({
     { view: "notifications", label: "Notifications" },
     { view: "queue", label: "Queue Operations" },
   ];
+
+  useEffect(() => {
+    let active = true;
+    const loadReadiness = async () => {
+      try {
+        const response = await fetch(`${API_URL}/health/ready`);
+        const payload = (await response.json()) as ReadinessResponse;
+        if (active) setReadiness(payload);
+      } catch {
+        if (active) setReadiness(null);
+      }
+    };
+    void loadReadiness();
+    const intervalId = window.setInterval(() => void loadReadiness(), 10_000);
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, []);
 
   return (
     <aside className="flex min-h-screen w-64 shrink-0 flex-col bg-slate-950 px-4 py-5 text-white">
@@ -516,7 +542,28 @@ function Sidebar({
         ))}
       </nav>
       <div className="mt-auto rounded-md border border-slate-800 px-3 py-3 text-xs text-slate-400">
-        API: {API_URL}
+        <div className="mb-2 flex items-center gap-2 font-medium text-slate-200">
+          <span className={`h-2 w-2 rounded-full ${healthDotClass(readiness?.status ?? null)}`} />
+          {healthLabel(readiness?.status ?? null)}
+        </div>
+        {readiness ? (
+          <div className="mb-2 space-y-1">
+            {([
+              ["Gmail", readiness.capabilities.gmail_ingestion],
+              ["Claude", readiness.capabilities.claude_processing],
+              ["Notifications", readiness.capabilities.notifications],
+              ["SLA scanner", readiness.capabilities.scheduled_sla_scanning],
+            ] as const).map(([label, capability]) => (
+              <div key={label} className="flex justify-between gap-2">
+                <span>{label}</span>
+                <span className="text-right text-slate-300">
+                  {safeReasonLabel(capability.reason_code) ?? capability.status}
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        <div className="truncate" title={API_URL}>API: {API_URL}</div>
       </div>
     </aside>
   );

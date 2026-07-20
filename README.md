@@ -44,6 +44,144 @@ Gmail Poller ──XADD──▶ Redis Stream (freight-ap:invoice-jobs:v1)
 - Explicit DLQ listing, idempotent replay, queue metrics, and age-based retention controls
 - Backend suite covering extraction, workflow, reconciliation, shipments, and reliable delivery
 
+## Health and Readiness
+
+The demo exposes three deliberately small health contracts. `GET /health/live`
+answers whether the HTTP process is running. `GET /health/ready` actively checks
+the dependencies needed for persisted and queued workflows. The legacy
+`GET /health` remains HTTP 200 with its original response shape.
+
+Core readiness requires PostgreSQL, the LangGraph checkpoint schema, Redis, and
+an invoice worker that has initialized its Redis consumer group. A core failure
+returns HTTP 503 with `status: unavailable` and `ready: false`. Gmail ingestion,
+Claude processing, notifications, and scheduled SLA scanning are capabilities;
+their failure returns HTTP 200 with `status: degraded` while core remains ready.
+
+Every active dependency probe is bounded by `HEALTH_PROBE_TIMEOUT_SECONDS` (one
+second by default) and runs concurrently. PostgreSQL uses a read-only `SELECT 1`.
+Checkpoint readiness uses the real psycopg connection and verifies the readable
+`checkpoint_migrations`, `checkpoints`, `checkpoint_blobs`, and
+`checkpoint_writes` tables plus `checkpoint_writes.task_path`; it never invokes
+the DDL-producing saver setup. Redis uses `PING`, while detailed stream, pending,
+and DLQ state remains available from `/operations/queue/metrics`.
+
+Readiness never refreshes a Gmail token, opens interactive OAuth, contacts the
+Gmail API, enqueues work, or changes mailbox state. It only parses local token
+material. Anthropic readiness only verifies non-placeholder configuration and
+never constructs a client or makes a paid model call. Responses contain only
+whitelisted reason codes—never credentials, tokens, connection strings, file
+paths, email addresses, or raw exception details.
+
+Gmail polling defaults to `GMAIL_POLL_INTERVAL_SECONDS=300`. Gmail and SLA
+success becomes stale after its cadence multiplied by
+`HEALTH_STALE_AFTER_MULTIPLIER=2.5` (750 seconds at the default Gmail cadence).
+The latest failure remains degraded until a later success. Notification delivery
+is work-driven and has no timer-based freshness rule.
+
+### Public response examples
+
+These marked examples are parsed and schema-validated by the test suite. They
+are public behavior and must change atomically with the implementation.
+
+<!-- health-live:start -->
+```json
+{
+  "status": "alive",
+  "phase": "running",
+  "observed_at": "2026-07-19T16:05:00Z"
+}
+```
+<!-- health-live:end -->
+
+<!-- health-ready-healthy:start -->
+```json
+{
+  "status": "ready",
+  "ready": true,
+  "phase": "running",
+  "observed_at": "2026-07-19T16:05:00Z",
+  "dependencies": {
+    "postgresql": {"status": "available", "reason_code": null, "latency_ms": 4.2},
+    "checkpoints": {"status": "available", "reason_code": null, "latency_ms": 6.1},
+    "redis": {"status": "available", "reason_code": null, "latency_ms": 1.8},
+    "invoice_worker": {"status": "available", "reason_code": null, "latency_ms": null}
+  },
+  "capabilities": {
+    "gmail_ingestion": {"status": "available", "reason_code": null, "verification": "configuration_and_observed_runtime", "last_attempt_at": "2026-07-19T16:00:00Z", "last_success_at": "2026-07-19T16:00:01Z", "last_failure_at": null, "last_result_count": 2, "stale": false},
+    "claude_processing": {"status": "available", "reason_code": null, "verification": "configuration_only", "last_attempt_at": null, "last_success_at": null, "last_failure_at": null, "last_result_count": null, "stale": false},
+    "notifications": {"status": "available", "reason_code": null, "verification": "configuration_and_observed_runtime", "last_attempt_at": "2026-07-19T16:00:03Z", "last_success_at": "2026-07-19T16:00:03Z", "last_failure_at": null, "last_result_count": 1, "stale": false},
+    "scheduled_sla_scanning": {"status": "available", "reason_code": null, "verification": "observed_runtime", "last_attempt_at": "2026-07-19T16:00:01Z", "last_success_at": "2026-07-19T16:00:02Z", "last_failure_at": null, "last_result_count": 0, "stale": false}
+  }
+}
+```
+<!-- health-ready-healthy:end -->
+
+<!-- health-ready-degraded:start -->
+```json
+{
+  "status": "degraded",
+  "ready": true,
+  "phase": "running",
+  "observed_at": "2026-07-19T16:20:00Z",
+  "dependencies": {
+    "postgresql": {"status": "available", "reason_code": null, "latency_ms": 4.2},
+    "checkpoints": {"status": "available", "reason_code": null, "latency_ms": 6.1},
+    "redis": {"status": "available", "reason_code": null, "latency_ms": 1.8},
+    "invoice_worker": {"status": "available", "reason_code": null, "latency_ms": null}
+  },
+  "capabilities": {
+    "gmail_ingestion": {"status": "unavailable", "reason_code": "gmail_token_missing", "verification": "configuration_only", "last_attempt_at": "2026-07-19T16:15:00Z", "last_success_at": null, "last_failure_at": "2026-07-19T16:15:00Z", "last_result_count": null, "stale": false},
+    "claude_processing": {"status": "unavailable", "reason_code": "anthropic_not_configured", "verification": "configuration_only", "last_attempt_at": null, "last_success_at": null, "last_failure_at": null, "last_result_count": null, "stale": false},
+    "notifications": {"status": "unavailable", "reason_code": "gmail_token_missing", "verification": "configuration_only", "last_attempt_at": null, "last_success_at": null, "last_failure_at": null, "last_result_count": null, "stale": false},
+    "scheduled_sla_scanning": {"status": "degraded", "reason_code": "background_success_stale", "verification": "observed_runtime", "last_attempt_at": "2026-07-19T16:00:00Z", "last_success_at": "2026-07-19T16:00:01Z", "last_failure_at": null, "last_result_count": 0, "stale": true}
+  }
+}
+```
+<!-- health-ready-degraded:end -->
+
+<!-- health-ready-unavailable:start -->
+```json
+{
+  "status": "unavailable",
+  "ready": false,
+  "phase": "running",
+  "observed_at": "2026-07-19T16:25:00Z",
+  "dependencies": {
+    "postgresql": {"status": "unavailable", "reason_code": "probe_timeout", "latency_ms": 1000.0},
+    "checkpoints": {"status": "unavailable", "reason_code": "postgresql_unavailable", "latency_ms": null},
+    "redis": {"status": "available", "reason_code": null, "latency_ms": 1.9},
+    "invoice_worker": {"status": "available", "reason_code": null, "latency_ms": null}
+  },
+  "capabilities": {
+    "gmail_ingestion": {"status": "degraded", "reason_code": "background_success_stale", "verification": "configuration_and_observed_runtime", "last_attempt_at": "2026-07-19T16:10:00Z", "last_success_at": "2026-07-19T16:10:01Z", "last_failure_at": null, "last_result_count": 0, "stale": true},
+    "claude_processing": {"status": "available", "reason_code": null, "verification": "configuration_only", "last_attempt_at": null, "last_success_at": null, "last_failure_at": null, "last_result_count": null, "stale": false},
+    "notifications": {"status": "available", "reason_code": null, "verification": "configuration_only", "last_attempt_at": null, "last_success_at": null, "last_failure_at": null, "last_result_count": null, "stale": false},
+    "scheduled_sla_scanning": {"status": "degraded", "reason_code": "postgresql_unavailable", "verification": "observed_runtime", "last_attempt_at": "2026-07-19T16:20:00Z", "last_success_at": "2026-07-19T16:15:01Z", "last_failure_at": "2026-07-19T16:20:00Z", "last_result_count": 0, "stale": false}
+  }
+}
+```
+<!-- health-ready-unavailable:end -->
+
+<!-- health-legacy:start -->
+```json
+{
+  "status": "ok",
+  "missing_document_sla_scanner": {
+    "status": "ok",
+    "last_started_at": null,
+    "last_succeeded_at": null,
+    "last_error": null,
+    "consecutive_failures": 0
+  }
+}
+```
+<!-- health-legacy:end -->
+
+Health history is process-local and resets on restart. Configuration-only Claude
+and Gmail checks do not prove provider reachability, key validity, quota, or a
+future token refresh. Redis `PING` does not replace queue metrics, and readable
+checkpoint storage cannot guarantee every future write.
+
 ## Local Development
 
 ### Prerequisites
